@@ -1,0 +1,80 @@
+# =============================================================================
+#  VirtuaOS — Virtualization stack (Debian 13 Trixie — validated packages)
+#  KVM / QEMU / libvirt / LXC / VirtIO / SPICE / VirGL / swTPM / VirtIO-FS
+# =============================================================================
+
+# KVM / QEMU
+cpu-checker
+qemu-kvm
+qemu-system-x86
+qemu-system-common
+qemu-system-data
+qemu-system-gui
+qemu-utils
+qemu-block-extra
+qemu-efi-aarch64
+
+# Firmware (UEFI, SeaBIOS)
+ovmf
+ovmf-ia32
+seabios
+
+# libvirt
+libvirt-daemon
+libvirt-daemon-system
+libvirt-clients
+libvirt-daemon-driver-qemu
+libvirt-daemon-driver-lxc
+virtinst
+libnss-libvirt
+
+# LXC
+# Note: lxc-utils and lxc-net do NOT exist in Debian 13 — functionality
+# is included in the main 'lxc' and 'lxcfs' packages
+lxc
+lxc-templates
+lxcfs
+
+# TPM emulation (virtual TPM for Windows 11 / secure boot)
+swtpm
+swtpm-tools
+
+# 3D / GPU acceleration (VirGL)
+libvirglrenderer1
+mesa-utils
+libgl1
+libegl1
+libgles2
+libgbm1
+libdrm2
+libepoxy0
+
+# SPICE remote display
+spice-vdagent
+libspice-server1
+qemu-system-modules-spice
+qemu-system-modules-opengl
+
+# VirtIO-FS (file sharing host ↔ guest)
+virtiofsd
+
+# Cloud images utility
+cloud-image-utils
+
+# Image / container creation
+genisoimage
+debootstrap
+uidmap
+
+# Backup compression (zstd preferred, pigz = parallel gzip fallback)
+zstd
+pigz
+# pv = real backup progress (bytes processed) streamed to the UI
+pv
+
+# Console access (noVNC / websockify)
+websockify
+novnc
+
+# Terminal UI for `virtua gui` (ncurses dialog boxes)
+dialog

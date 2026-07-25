@@ -1,0 +1,8 @@
+# AuxiNux Virtua kernel repository — BUILD TIME only.
+# live-build adds this source during the chroot stage (before the kernel is
+# installed) and removes it from the final image. The matching signing key is
+# provided as auxinux-kernel.key.chroot (injected at build time by build.sh from
+# https://dep.auxinux.ca/VIRTUA/virtua-archive-keyring.asc, or AUXINUX_KEYRING_FILE).
+# Persistence on the INSTALLED system is handled separately via
+# includes.chroot/etc/apt/sources.list.d/auxinux-kernel.sources.
+deb [arch=amd64] https://dep.auxinux.ca/VIRTUA kernel main

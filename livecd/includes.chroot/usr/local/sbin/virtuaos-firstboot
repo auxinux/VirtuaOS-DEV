@@ -1,0 +1,101 @@
+#!/usr/bin/env bash
+# =============================================================================
+#  VirtuaOS — First boot of the installed system (one-shot)
+#  Generates unique secrets that must NOT be shared between installations
+#  - Fresh SESSION_SECRET in Virtua .env
+#  - Fresh SSH host keys
+#  - Fresh machine-id (if not already regenerated)
+# =============================================================================
+set -euo pipefail
+
+MARKER_DIR="/etc/virtuaos"
+MARKER_FILE="${MARKER_DIR}/.firstboot-done"
+ENV_FILE="/opt/auxinux-virtua/apps/api/.env"
+
+log() { echo "[VirtuaOS-firstboot] $*"; }
+
+mkdir -p "${MARKER_DIR}"
+
+# ── 1. Unique AUXINUX_SESSION_SECRET ─────────────────────────────────────────
+# Matches the AUXINUX_SESSION_SECRET=__REGENERATE_ON_FIRST_BOOT__ placeholder
+# written by the 0400-virtua hook. Without the AUXINUX_ prefix the API silently
+# falls back to the dev secret and warns at every boot.
+if [[ -f "${ENV_FILE}" ]] && grep -q "__REGENERATE_ON_FIRST_BOOT__" "${ENV_FILE}"; then
+    NEW_SECRET="$(openssl rand -hex 48)"
+    sed -i "s|__REGENERATE_ON_FIRST_BOOT__|${NEW_SECRET}|" "${ENV_FILE}"
+    chmod 0600 "${ENV_FILE}"
+    log "Unique AUXINUX_SESSION_SECRET generated."
+fi
+
+# ── 1b. Seed AuxiNux admin password from installer choice ────────────────────
+# The installer drops the chosen admin password into /etc/virtuaos/admin-password.seed
+# (mode 0600). The API reads AUXINUX_INITIAL_ADMIN_PASSWORD from .env at first DB init
+# and seeds the admin user with it, skipping the "force password change" flag.
+SEED_FILE="${MARKER_DIR}/admin-password.seed"
+if [[ -f "${SEED_FILE}" && -f "${ENV_FILE}" ]] && ! grep -q "^AUXINUX_INITIAL_ADMIN_PASSWORD=" "${ENV_FILE}"; then
+    SEED_PASS="$(cat "${SEED_FILE}")"
+    if [[ -n "${SEED_PASS}" ]]; then
+        # Quote with single quotes; escape any single quote in the password.
+        ESCAPED="${SEED_PASS//\'/\'\\\'\'}"
+        printf "\nAUXINUX_INITIAL_ADMIN_PASSWORD='%s'\n" "${ESCAPED}" >> "${ENV_FILE}"
+        chmod 0600 "${ENV_FILE}"
+        log "Admin panel password seeded into .env"
+    fi
+    # Remove the seed file once consumed — it has done its job and should not linger.
+    rm -f "${SEED_FILE}"
+fi
+
+# ── 2. Fresh SSH host keys ───────────────────────────────────────────────────
+# Use ssh-keygen -A, NOT `dpkg-reconfigure openssh-server`. dpkg-reconfigure
+# triggers `systemctl restart ssh.service`, but this oneshot is ordered
+# Before=ssh.service — so that restart blocks waiting for us to finish while we
+# block waiting for it: a deadlock that hangs firstboot forever and prevents the
+# Virtua API (ordered after firstboot) from ever starting. ssh-keygen -A just
+# (re)creates the missing host keys with no service restart; ssh.service then
+# starts after us and picks them up.
+if [[ -d /etc/ssh ]]; then
+    rm -f /etc/ssh/ssh_host_*
+    ssh-keygen -A
+    log "SSH host keys regenerated."
+fi
+
+# ── 3. Fresh machine-id (if still the live one) ──────────────────────────────
+if [[ -f /etc/machine-id ]] && [[ -s /etc/machine-id ]]; then
+    : # already set by systemd at boot; no action
+fi
+
+# ── 4. Load KVM module matching CPU ──────────────────────────────────────────
+if grep -q vmx /proc/cpuinfo 2>/dev/null; then
+    modprobe kvm_intel 2>/dev/null || true
+    echo "kvm_intel" >> /etc/modules-load.d/virtuaos.conf
+elif grep -q svm /proc/cpuinfo 2>/dev/null; then
+    modprobe kvm_amd 2>/dev/null || true
+    echo "kvm_amd" >> /etc/modules-load.d/virtuaos.conf
+fi
+
+# ── 5. Define libvirt default network ────────────────────────────────────────
+if command -v virsh >/dev/null 2>&1; then
+    if ! virsh net-info default >/dev/null 2>&1; then
+        TMPNET="$(mktemp)"
+        cat > "${TMPNET}" <<'EOF'
+<network>
+  <name>default</name>
+  <forward mode="nat"/>
+  <bridge name="virbr0" stp="on" delay="0"/>
+  <ip address="192.168.122.1" netmask="255.255.255.0">
+    <dhcp><range start="192.168.122.100" end="192.168.122.200"/></dhcp>
+  </ip>
+</network>
+EOF
+        virsh net-define "${TMPNET}" 2>/dev/null && \
+        virsh net-autostart default 2>/dev/null && \
+        virsh net-start default 2>/dev/null || true
+        rm -f "${TMPNET}"
+        log "libvirt default network configured."
+    fi
+fi
+
+# ── Done ─────────────────────────────────────────────────────────────────────
+date -u +"%Y-%m-%dT%H:%M:%SZ" > "${MARKER_FILE}"
+chmod 0444 "${MARKER_FILE}"
+log "First-boot regeneration complete."

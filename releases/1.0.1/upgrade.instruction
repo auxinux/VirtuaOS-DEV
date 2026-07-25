@@ -1,0 +1,38 @@
+{
+  "version": "1.0.1",
+  "messages": [
+    "Mise à jour de maintenance VirtuaOS 1.0.1.",
+    "Cette version corrige le marqueur et garde l’installation existante intacte."
+  ],
+  "files": [
+    {
+      "path": "/etc/os-release"
+    },
+    {
+      "path": "/etc/issue"
+    },
+    {
+      "path": "/etc/issue.net"
+    },
+    {
+      "path": "/etc/profile.d/virtuaos.sh",
+      "mode": "0755"
+    },
+    {
+      "path": "/usr/local/bin/virtuaos-status",
+      "mode": "0755"
+    }
+  ],
+  "aptInstall": [
+    "kernel-virtua",
+    "auxinux-virtua",
+    "virtuaos-cli"
+  ],
+  "commands": [
+    {
+      "description": "Écrire le marqueur de version VirtuaOS",
+      "run": "printf '%s\\n' '1.0.1' > /etc/virtuaos-version"
+    }
+  ],
+  "rebootRequired": false
+}

@@ -1,0 +1,75 @@
+#!/usr/bin/env bash
+# =============================================================================
+#  Hook 0450 — Firewall rules persistence
+#  Opens SSH (22), AuxiNux web panel (8441), HTTP (80, for Let's Encrypt challenge)
+#  and HTTPS (443) on the installed system. Rules are made persistent through
+#  iptables-persistent / netfilter-persistent so they survive reboots without a
+#  custom systemd unit.
+# =============================================================================
+set -euo pipefail
+
+echo "[VirtuaOS] Configuring firewall (open 22, 80, 443, 8441)…"
+
+# The iptables-persistent postinst normally prompts to save current rules.
+# Pre-seed debconf so it installs non-interactively.
+echo "iptables-persistent iptables-persistent/autosave_v4 boolean false" | debconf-set-selections
+echo "iptables-persistent iptables-persistent/autosave_v6 boolean false" | debconf-set-selections
+
+DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+    iptables-persistent netfilter-persistent 2>&1 | tail -5
+
+mkdir -p /etc/iptables
+
+# ── IPv4 ruleset ─────────────────────────────────────────────────────────────
+# - ACCEPT loopback + already-established (Docker/libvirt friendly)
+# - Open: SSH (22), AuxiNux UI (8441), HTTP (80), HTTPS (443)
+# - INPUT default policy stays ACCEPT so we don't fight Docker/libvirt chains.
+cat > /etc/iptables/rules.v4 <<'EOF'
+*filter
+:INPUT ACCEPT [0:0]
+:FORWARD ACCEPT [0:0]
+:OUTPUT ACCEPT [0:0]
+
+# Loopback always
+-A INPUT -i lo -j ACCEPT
+
+# Established / related connections
+-A INPUT -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
+
+# ICMP (ping / path MTU discovery)
+-A INPUT -p icmp -j ACCEPT
+
+# Service ports
+-A INPUT -p tcp --dport 22   -j ACCEPT
+-A INPUT -p tcp --dport 80   -j ACCEPT
+-A INPUT -p tcp --dport 443  -j ACCEPT
+-A INPUT -p tcp --dport 8441 -j ACCEPT
+
+COMMIT
+EOF
+
+# ── IPv6 ruleset (mirror of v4) ──────────────────────────────────────────────
+cat > /etc/iptables/rules.v6 <<'EOF'
+*filter
+:INPUT ACCEPT [0:0]
+:FORWARD ACCEPT [0:0]
+:OUTPUT ACCEPT [0:0]
+
+-A INPUT -i lo -j ACCEPT
+-A INPUT -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
+-A INPUT -p ipv6-icmp -j ACCEPT
+
+-A INPUT -p tcp --dport 22   -j ACCEPT
+-A INPUT -p tcp --dport 80   -j ACCEPT
+-A INPUT -p tcp --dport 443  -j ACCEPT
+-A INPUT -p tcp --dport 8441 -j ACCEPT
+
+COMMIT
+EOF
+
+chmod 0644 /etc/iptables/rules.v4 /etc/iptables/rules.v6
+
+# Ensure the persistence service runs at boot.
+systemctl enable netfilter-persistent.service 2>/dev/null || true
+
+echo "[VirtuaOS] Firewall rules written + netfilter-persistent enabled."

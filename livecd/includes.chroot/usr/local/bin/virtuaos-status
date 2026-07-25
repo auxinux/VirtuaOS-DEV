@@ -1,0 +1,104 @@
+#!/usr/bin/env bash
+# =============================================================================
+#  VirtuaOS — System status command
+#  Usage: virtuaos-status
+# =============================================================================
+
+C_GREEN='\033[0;32m'; C_RED='\033[0;31m'; C_YELLOW='\033[1;33m'
+C_CYAN='\033[0;36m'; C_BOLD='\033[1m'; C_DIM='\033[2m'; C_NC='\033[0m'
+
+_ok()   { echo -e "    ${C_GREEN}●${C_NC} $*"; }
+_fail() { echo -e "    ${C_RED}✗${C_NC} $*"; }
+_warn() { echo -e "    ${C_YELLOW}⚠${C_NC} $*"; }
+
+svc_status() {
+    local svc="$1" label="$2"
+    local state
+    state="$(systemctl is-active "$svc" 2>/dev/null || echo 'inactive')"
+    if [[ "$state" == "active" ]]; then
+        _ok "${label}: ${C_GREEN}active${C_NC}"
+    elif [[ "$state" == "activating" ]]; then
+        _warn "${label}: ${C_YELLOW}starting…${C_NC}"
+    else
+        _fail "${label}: ${C_RED}${state}${C_NC}"
+    fi
+}
+
+# On Debian 13 the monolithic libvirtd is replaced by modular daemons
+# (virtqemud, virtnetworkd, virtstoraged…). Report whichever set is actually
+# servicing requests so the panel doesn't look "degraded" on a working host.
+libvirt_status() {
+    local label="Libvirt"
+    if systemctl is-active --quiet libvirtd.service 2>/dev/null; then
+        _ok "${label}: ${C_GREEN}active (libvirtd, monolithic)${C_NC}"
+        return
+    fi
+    if systemctl is-active --quiet virtqemud.service 2>/dev/null \
+       || systemctl is-active --quiet virtqemud.socket 2>/dev/null; then
+        _ok "${label}: ${C_GREEN}active (virtqemud, modular)${C_NC}"
+        return
+    fi
+    _fail "${label}: ${C_RED}inactive${C_NC} (neither libvirtd nor virtqemud)"
+}
+
+SERVER_IP="$(ip route get 8.8.8.8 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="src") print $(i+1)}' | head -1 || echo 'N/A')"
+UPTIME="$(uptime -p 2>/dev/null | sed 's/^up //' || echo 'N/A')"
+LOAD="$(cut -d' ' -f1-3 /proc/loadavg 2>/dev/null)"
+MEM_TOTAL="$(awk '/MemTotal/ {printf "%.0f", $2/1024}' /proc/meminfo)"
+MEM_FREE="$(awk '/MemAvailable/ {printf "%.0f", $2/1024}' /proc/meminfo)"
+MEM_USED=$(( MEM_TOTAL - MEM_FREE ))
+DISK="$(df -h / | awk 'NR==2 {print $3"/"$2" ("$5")"}')"
+KVM_STATUS="$( [[ -e /dev/kvm ]] && echo 'available' || echo 'NOT available' )"
+DOCKER_VER="$(docker --version 2>/dev/null | cut -d' ' -f3 | tr -d ',' || echo 'N/A')"
+NODE_VER="$(node --version 2>/dev/null || echo 'N/A')"
+VIRTUA_PORT="8441"
+
+echo ""
+echo -e "${C_BOLD}${C_CYAN}  VirtuaOS 1.0.2-BETA — System Status${C_NC}"
+echo -e "  ─────────────────────────────────────────────"
+
+echo -e "\n  ${C_BOLD}System${C_NC}"
+echo -e "    IP Address   : ${SERVER_IP}"
+echo -e "    Uptime       : ${UPTIME}"
+echo -e "    Load         : ${LOAD}"
+echo -e "    Memory       : ${MEM_USED} MB used / ${MEM_TOTAL} MB total"
+echo -e "    Disk (/)     : ${DISK}"
+echo -e "    KVM          : ${KVM_STATUS}"
+
+echo -e "\n  ${C_BOLD}Runtimes${C_NC}"
+echo -e "    Node.js      : ${NODE_VER}"
+echo -e "    Docker       : ${DOCKER_VER}"
+
+echo -e "\n  ${C_BOLD}Virtua Services${C_NC}"
+svc_status "auxinuxvirtual-runner" "Runner"
+svc_status "auxinuxvirtual-api"    "API"
+svc_status "docker"                "Docker"
+libvirt_status
+svc_status "lxc-net"               "LXC bridge"
+
+echo -e "\n  ${C_BOLD}Web Panel${C_NC}"
+echo -e "    ${C_CYAN}http://${SERVER_IP}:${VIRTUA_PORT}${C_NC}  (HTTP)"
+echo -e "    ${C_CYAN}https://${SERVER_IP}${C_NC}        (HTTPS — configure SSL in Settings)"
+
+# First-boot status
+if [[ -f /etc/virtuaos/.firstboot-done ]]; then
+    FB_DATE="$(cat /etc/virtuaos/.firstboot-done)"
+    echo -e "\n  ${C_BOLD}First-Boot${C_NC}"
+    echo -e "    ${C_GREEN}✓ Completed${C_NC} on ${FB_DATE}"
+else
+    echo -e "\n  ${C_BOLD}First-Boot${C_NC}"
+    echo -e "    ${C_YELLOW}⚠ Pending or in progress${C_NC}"
+    echo -e "    Follow: ${C_CYAN}journalctl -fu virtuaos-firstboot${C_NC}"
+fi
+
+echo ""
+
+# Quick log tail if services are failing
+for svc in auxinuxvirtual-api auxinuxvirtual-runner; do
+    state="$(systemctl is-active "$svc" 2>/dev/null || echo 'inactive')"
+    if [[ "$state" != "active" ]]; then
+        echo -e "  ${C_DIM}Last 5 lines from ${svc}:${C_NC}"
+        journalctl -u "$svc" -n 5 --no-pager 2>/dev/null | sed 's/^/  /' || true
+        echo ""
+    fi
+done

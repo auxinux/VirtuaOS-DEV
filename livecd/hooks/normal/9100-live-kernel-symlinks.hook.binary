@@ -1,0 +1,45 @@
+#!/bin/sh
+# =============================================================================
+#  Hook 9100 (binary) — Generic /live/vmlinuz + /live/initrd.img symlinks
+#
+#  live-build's binary stage copies the kernel from the chroot using VERSIONED
+#  names only (e.g. live/vmlinuz-7.4.2-auxinux-virtua-amd64). VirtuaOS ships its
+#  own static GRUB menus (config/bootloaders/grub-*/grub.cfg) that reference the
+#  GENERIC paths /live/vmlinuz and /live/initrd.img so they stay independent of
+#  the exact kernel version. This hook creates those generic names.
+#
+#  Runs with CWD = binary/ (see live-build scripts/build/binary_hooks), after
+#  binary_linux-image and before binary_checksums/binary_iso, so the generic
+#  files are checksummed and packed into the ISO.
+# =============================================================================
+set -e
+
+INITFS="live"
+[ -d "${INITFS}" ] || INITFS="boot"   # netboot/hdd layouts use boot/
+
+cd "${INITFS}"
+
+# Prefer the AuxiNux Virtua kernel; otherwise take the highest-versioned kernel.
+KERNEL="$(ls -1 vmlinuz-*auxinux-virtua* 2>/dev/null | sort -V | tail -n1 || true)"
+[ -n "${KERNEL}" ] || KERNEL="$(ls -1 vmlinuz-* 2>/dev/null | sort -V | tail -n1 || true)"
+
+if [ -z "${KERNEL}" ]; then
+    echo "[VirtuaOS][hook 9100][FATAL] No vmlinuz-* found in ${INITFS}/ — the kernel was not embedded into the live image." >&2
+    exit 1
+fi
+
+VERSION="${KERNEL#vmlinuz-}"
+INITRD="initrd.img-${VERSION}"
+
+if [ ! -e "${INITRD}" ]; then
+    echo "[VirtuaOS][hook 9100][FATAL] Matching initrd ${INITRD} missing for ${KERNEL}." >&2
+    exit 1
+fi
+
+# Create generic names only if absent (don't clobber a layout that already
+# provides them). Use copies rather than symlinks: ISO9660/GRUB handling of
+# symlinks across the live medium is far less reliable than plain files.
+[ -e vmlinuz ]    || cp -a "${KERNEL}" vmlinuz
+[ -e initrd.img ] || cp -a "${INITRD}" initrd.img
+
+echo "[VirtuaOS][hook 9100] Generic kernel ready: ${INITFS}/vmlinuz -> ${KERNEL} (+ ${INITRD})"

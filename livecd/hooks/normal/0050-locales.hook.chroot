@@ -1,0 +1,25 @@
+#!/usr/bin/env bash
+# =============================================================================
+#  Hook 0050 — Pre-generate multiple locales (so installer can switch instantly)
+# =============================================================================
+set -euo pipefail
+
+echo "[VirtuaOS] Generating locales…"
+
+cat > /etc/locale.gen <<'EOF'
+en_US.UTF-8 UTF-8
+en_GB.UTF-8 UTF-8
+fr_FR.UTF-8 UTF-8
+fr_CA.UTF-8 UTF-8
+es_ES.UTF-8 UTF-8
+de_DE.UTF-8 UTF-8
+it_IT.UTF-8 UTF-8
+pt_BR.UTF-8 UTF-8
+pt_PT.UTF-8 UTF-8
+nl_NL.UTF-8 UTF-8
+EOF
+
+locale-gen >/dev/null 2>&1
+update-locale LANG=en_US.UTF-8 LC_ALL=en_US.UTF-8 >/dev/null 2>&1 || true
+
+echo "[VirtuaOS] Locales generated."

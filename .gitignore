@@ -1,0 +1,15 @@
+.DS_Store
+._*
+
+.build/
+output/
+workspace/
+*.iso
+*.tar.gz
+
+virtuaos-cli/target/
+virtuaos-installer/target/
+
+# Generated Linux installer binary staged into the live image.
+livecd/includes.chroot/usr/local/sbin/virtuaos-installer
+.claude/settings.local.json

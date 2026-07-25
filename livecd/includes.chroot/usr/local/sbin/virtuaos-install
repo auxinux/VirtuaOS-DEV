@@ -1,0 +1,1444 @@
+#!/usr/bin/env bash
+# =============================================================================
+#  VirtuaOS Installer 1.0.0
+#
+#  Pure shell + whiptail installer. Copies the live filesystem to disk,
+#  sets up locale/keyboard/hostname, installs GRUB, reboots.
+#
+#  Usage:
+#    virtuaos-install            Interactive (asks for everything)
+#    virtuaos-install --auto     Auto-pick first internal disk, defaults rest
+# =============================================================================
+set -uo pipefail   # NOTE: removed -e — we trap errors manually for better UX
+
+[[ $EUID -eq 0 ]] || { echo "Must run as root."; exit 1; }
+
+# ── AuxiNux whiptail/newt color theme — BLACK / WHITE / ORANGE ────────────────
+# Requested scheme: black background, white text everywhere, and the FOCUSED
+# (highlighted) element on ORANGE with white text.
+#
+# CRITICAL: only use colour names newt actually recognises:
+#   black blue green cyan red magenta brown lightgray gray
+#   brightblue brightgreen brightcyan brightred brightmagenta yellow white
+# There is NO "brightwhite" — using it makes newt DISCARD that whole line and
+# fall back to its built-in default (white-on-BLUE), and on this framebuffer
+# console blue is mis-mapped to a garish green. That bug is exactly why earlier
+# themes still showed green. Here "white" = bright white, and "brown" = the
+# orange slot (palette index 3), which set_console_palette() reprograms to the
+# AuxiNux logo orange so the highlight is a clean orange, not a muddy brown.
+export NEWT_COLORS='
+root=white,black
+border=white,black
+window=white,black
+shadow=black,black
+title=white,black
+button=black,white
+actbutton=white,brown
+compactbutton=white,black
+checkbox=white,black
+actcheckbox=white,brown
+entry=white,black
+disentry=gray,black
+label=white,black
+listbox=white,black
+actlistbox=white,brown
+sellistbox=white,black
+actsellistbox=white,brown
+textbox=white,black
+acttextbox=white,brown
+emptyscale=white,gray
+fullscale=white,brown
+helpline=white,black
+roottext=white,black
+'
+
+# ── Suppress kernel/systemd messages on the console ───────────────────────────
+dmesg -n 1 2>/dev/null || true
+echo 0 > /proc/sys/kernel/printk 2>/dev/null || true
+
+clear
+reset
+
+# ── Force a standard 16-colour VGA palette on the console ─────────────────────
+# The AuxiNux kernel's framebuffer (KMS) console comes up with a SCRAMBLED colour
+# map: newt/whiptail then renders our theme with the wrong colours (black shows
+# as green, white as orange, blue as green…), making the wizard illegible. No
+# NEWT_COLORS theme can fix a broken palette — we must reprogram the palette
+# itself. These OSC-P sequences (a Linux-console feature, honoured by fbcon/KMS)
+# overwrite all 16 palette entries with the canonical VGA RGB values, so named
+# colours render correctly regardless of the kernel's initial (wrong) map.
+set_console_palette() {
+    case "${TERM:-linux}" in linux|linux-*|"") ;; *) return 0 ;; esac   # real VT only
+    [ -t 1 ] || return 0
+    # Index 3 ("brown") is reprogrammed from the dull VGA aa5500 to the AuxiNux
+    # logo orange (e8590c) — that's the highlight colour the theme uses.
+    printf '\033]P0000000\033]P1aa0000\033]P200aa00\033]P3e8590c'  # 0-3  blk red grn ORANGE
+    printf '\033]P40000aa\033]P5aa00aa\033]P600aaaa\033]P7aaaaaa'  # 4-7  blu mag cyn wht
+    printf '\033]P8555555\033]P9ff5555\033]PA55ff55\033]PBffff55'  # 8-11 bright blk-yel
+    printf '\033]PC5555ff\033]PDff55ff\033]PE55ffff\033]PFffffff'  # C-F  bright blu-wht
+    clear   # repaint with the corrected palette
+}
+set_console_palette
+
+AUTO_MODE=false
+# BACKEND_MODE: non-interactive. Answers are read from CONF_FILE and progress is
+# streamed to PROGRESS_FILE for the Rust front-end (virtuaos-installer) to render.
+# All the proven plumbing (partition/copy/chroot_target/grub) is shared verbatim
+# between this mode and the legacy whiptail wizard — only the UI layer differs.
+BACKEND_MODE=false
+CONF_FILE="/run/virtuaos-install.conf"
+for _arg in "$@"; do
+    case "${_arg}" in
+        --auto)    AUTO_MODE=true ;;
+        --backend) BACKEND_MODE=true ;;
+        --conf=*)  CONF_FILE="${_arg#--conf=}" ;;
+    esac
+done
+
+VERSION="1.0.2-BETA"
+TARGET="/mnt/target"
+LIVE_ROOT="/"
+LOG="/var/log/virtuaos-install.log"
+# Machine-readable progress (key=value), rewritten atomically each step so the
+# Rust front-end can tail it. Lives on tmpfs (/run).
+PROGRESS_FILE="${VIRTUAOS_INSTALL_PROGRESS:-/run/virtuaos-install.progress}"
+CHROOT_SHELL="/bin/bash"
+
+# ── Error trap: show the failed line + last log lines in whiptail ─────────────
+on_error() {
+    local exit_code=$?
+    local line_no=$1
+    local cmd=$2
+
+    # Restore console messages so we can see anything else
+    echo 4 > /proc/sys/kernel/printk 2>/dev/null || true
+
+    # Backend mode: no whiptail. Record the failure for the Rust front-end and bail.
+    if ${BACKEND_MODE}; then
+        write_progress_status failed "line ${line_no} (exit ${exit_code}): ${cmd}"
+        log "BACKEND FAILED at line ${line_no} (exit ${exit_code}): ${cmd}"
+        cleanup_mounts 2>/dev/null || true
+        exit "${exit_code}"
+    fi
+
+    local last_log=""
+    if [[ -f "${LOG}" ]]; then
+        last_log="$(tail -20 "${LOG}" 2>/dev/null)"
+    fi
+
+    whiptail \
+        --title "VirtuaOS Installer — FATAL ERROR" \
+        --msgbox "Installation failed at step:\n  $(t "${PROGRESS_STEP:-?}" "${PROGRESS_STEP:-?}")\n\nLine ${line_no} (exit ${exit_code}):\n  ${cmd}\n\nLast log lines:\n${last_log}\n\nFull log: ${LOG}" \
+        24 78 2>/dev/null || {
+            # Whiptail might fail if terminal is broken — print to console
+            echo "═══════ INSTALLATION FAILED ═══════"
+            echo "Line ${line_no} (exit ${exit_code}): ${cmd}"
+            echo "Step: ${PROGRESS_STEP:-?}"
+            echo "Log:  ${LOG}"
+            echo "Last lines of log:"
+            echo "${last_log}"
+            echo "════════════════════════════════════"
+        }
+
+    # Cleanup mounts so user can retry
+    cleanup_mounts 2>/dev/null || true
+
+    exit "${exit_code}"
+}
+
+cleanup_mounts() {
+    sync
+    for m in dev/pts dev proc sys run boot/efi ""; do
+        umount -lf "${TARGET}/${m}" 2>/dev/null || true
+    done
+    umount -lf "${TARGET}" 2>/dev/null || true
+}
+
+trap 'on_error ${LINENO} "${BASH_COMMAND}"' ERR
+set -e
+
+# Default values
+LANG_CODE="en_US.UTF-8"
+KEYMAP="us"
+HOSTNAME="virtuaos"
+DISK=""
+TZ="UTC"
+ROOT_PASSWORD=""
+ADMIN_PASSWORD=""
+# Network (empty NET_IFACE = leave the default DHCP link the live env set up)
+NET_IFACE=""
+NET_KIND="ethernet"
+WIFI_SSID=""
+WIFI_PASSWORD=""
+NET_METHOD="dhcp"
+NET_ADDRESS=""
+NET_GATEWAY=""
+NET_DNS=""
+
+# ── Helpers ───────────────────────────────────────────────────────────────────
+log()    { echo "[$(date +%H:%M:%S)] $*" | tee -a "${LOG}"; }
+
+# Bilingual UI strings — set after choose_language()
+UI_LANG="en"   # "en" or "fr"
+
+# Returns the right string based on UI_LANG
+t() {
+    local en="$1" fr="$2"
+    [[ "${UI_LANG}" == "fr" ]] && echo "${fr}" || echo "${en}"
+}
+
+# ── Live progress display (infobox — updates in place, no OK button) ──────────
+# Usage: progress <0-100> "Step name" "detail line (optional)"
+PROGRESS_PCT=0
+PROGRESS_STEP=""
+
+# Atomically write the machine-readable progress file consumed by the Rust
+# front-end (virtuaos-installer). Best-effort: never let a /run write failure
+# abort the install. status = running | done | failed.
+write_progress_status() {
+    local status="$1" detail="${2:-}"
+    {
+        echo "pct=${PROGRESS_PCT}"
+        echo "label=${PROGRESS_STEP}"
+        echo "detail=${detail}"
+        echo "status=${status}"
+        echo "ts=$(date +%s)"
+    } > "${PROGRESS_FILE}.tmp" 2>/dev/null \
+        && mv -f "${PROGRESS_FILE}.tmp" "${PROGRESS_FILE}" 2>/dev/null || true
+}
+
+progress() {
+    PROGRESS_PCT="${1}"
+    PROGRESS_STEP="${2}"
+    local detail="${3:-}"
+    log "  [${PROGRESS_PCT}%] ${PROGRESS_STEP}${detail:+ — ${detail}}"
+    write_progress_status running "${detail}"
+
+    # Backend mode: the Rust front-end owns the screen — don't draw whiptail.
+    ${BACKEND_MODE} && return 0
+
+    # ASCII progress bar (40 chars wide)
+    local filled=$(( PROGRESS_PCT * 40 / 100 ))
+    local empty=$(( 40 - filled ))
+    local bar=""
+    local i
+    for (( i=0; i<filled; i++ )); do bar+="█"; done
+    for (( i=0; i<empty;  i++ )); do bar+="░"; done
+
+    local title
+    title="VirtuaOS ${VERSION} — $(t 'Installation' 'Installation')"
+
+    whiptail \
+        --title "${title}" \
+        --infobox "\n  ${PROGRESS_PCT}%  ${PROGRESS_STEP}\n\n  [${bar}]\n\n  ${detail}" \
+        12 72 2>/dev/null || true
+}
+
+die() {
+    if ${BACKEND_MODE}; then
+        write_progress_status failed "$*"
+        log "BACKEND die: $*"
+        cleanup_mounts 2>/dev/null || true
+        exit 1
+    fi
+    whiptail --title "$(t 'VirtuaOS Installer — ERROR' 'VirtuaOS Installer — ERREUR')" \
+        --msgbox "$*" 12 72
+    exit 1
+}
+
+log_target_runtime_diagnostics() {
+    log "---- target runtime diagnostics ----"
+    for path in \
+        /bin /bin/bash /usr/bin/bash /bin/sh /usr/bin/sh /usr/bin/env \
+        /lib /lib64 /usr/lib /usr/lib64 /lib/x86_64-linux-gnu /usr/lib/x86_64-linux-gnu \
+        /usr/sbin/grub-install
+    do
+        ls -ld "${TARGET}${path}" >> "${LOG}" 2>&1 || true
+    done
+
+    if command -v file >/dev/null 2>&1; then
+        file -L "${TARGET}/bin/bash" "${TARGET}/usr/bin/bash" "${TARGET}/bin/sh" "${TARGET}/usr/bin/sh" \
+            >> "${LOG}" 2>&1 || true
+    fi
+
+    if command -v ldd >/dev/null 2>&1; then
+        ldd "${TARGET}/bin/bash" >> "${LOG}" 2>&1 || true
+    fi
+    log "---- end target runtime diagnostics ----"
+}
+
+repair_merged_usr_links() {
+    # Debian 13 is usr-merged. If rsync copies a partial/broken symlink set,
+    # chroot can see /bin/bash but fail to execute it because /lib64/ld-linux...
+    # is not reachable. Repair only missing paths; never overwrite real dirs.
+    local pair link dest
+    for pair in \
+        "/bin:usr/bin" \
+        "/sbin:usr/sbin" \
+        "/lib:usr/lib" \
+        "/lib64:usr/lib64"
+    do
+        link="${pair%%:*}"
+        dest="${pair#*:}"
+        if [[ -L "${TARGET}${link}" && ! -e "${TARGET}${link}" ]]; then
+            rm -f "${TARGET}${link}"
+            log "Removed broken usrmerge link ${link}"
+        fi
+        if [[ ! -e "${TARGET}${link}" && -d "${TARGET}/${dest}" ]]; then
+            ln -s "${dest}" "${TARGET}${link}"
+            log "Repaired missing usrmerge link ${link} -> ${dest}"
+        fi
+    done
+}
+
+repair_dynamic_loader() {
+    local interpreter="$1"
+    [[ -z "${interpreter}" || -e "${TARGET}${interpreter}" ]] && return 0
+
+    local loader_name found root
+    loader_name="$(basename "${interpreter}")"
+    found=""
+    for root in "${TARGET}/usr/lib64" "${TARGET}/usr/lib" "${TARGET}/lib64" "${TARGET}/lib"; do
+        [[ -e "${root}" ]] || continue
+        found="$(find -L "${root}" -name "${loader_name}" -print -quit 2>/dev/null || true)"
+        [[ -n "${found}" ]] && break
+    done
+
+    if [[ -n "${found}" ]]; then
+        local parent
+        parent="$(dirname "${TARGET}${interpreter}")"
+        if [[ -L "${parent}" && ! -e "${parent}" ]]; then
+            rm -f "${parent}"
+            log "Removed broken loader parent symlink ${parent#${TARGET}}"
+        fi
+        mkdir -p "${parent}"
+        ln -sfn "${found#${TARGET}}" "${TARGET}${interpreter}"
+        log "Repaired dynamic loader ${interpreter} -> ${found#${TARGET}}"
+    fi
+}
+
+validate_target_runtime() {
+    progress 74 "$(t 'Validating copied system...' 'Validation du système copié...')" ""
+
+    repair_merged_usr_links
+
+    if [[ -x "${TARGET}/bin/bash" ]]; then
+        CHROOT_SHELL="/bin/bash"
+    elif [[ -x "${TARGET}/usr/bin/bash" ]]; then
+        CHROOT_SHELL="/usr/bin/bash"
+    elif [[ -x "${TARGET}/bin/sh" ]]; then
+        CHROOT_SHELL="/bin/sh"
+    elif [[ -x "${TARGET}/usr/bin/sh" ]]; then
+        CHROOT_SHELL="/usr/bin/sh"
+    else
+        log_target_runtime_diagnostics
+        die "$(t \
+            "No executable shell found in the installed target. The live filesystem copy is incomplete. Check ${LOG}" \
+            "Aucun shell exécutable trouvé dans la cible installée. La copie du système live est incomplète. Voir ${LOG}")"
+    fi
+
+    local interpreter=""
+    if command -v file >/dev/null 2>&1; then
+        interpreter="$(file -L "${TARGET}${CHROOT_SHELL}" 2>/dev/null | sed -n 's/.*interpreter \([^,]*\).*/\1/p' | head -1 || true)"
+        repair_dynamic_loader "${interpreter}"
+    fi
+
+    if ! chroot "${TARGET}" "${CHROOT_SHELL}" -c 'test -x /usr/bin/env && true' >> "${LOG}" 2>&1; then
+        log "Target chroot validation failed with shell ${CHROOT_SHELL}${interpreter:+, interpreter ${interpreter}}"
+        log_target_runtime_diagnostics
+        die "$(t \
+            "The copied target cannot run ${CHROOT_SHELL} inside chroot.\nThis usually means bash is present but its dynamic loader/libraries are missing or broken.\n\nDiagnostics were written to ${LOG}" \
+            "La cible copiée ne peut pas lancer ${CHROOT_SHELL} dans le chroot.\nHabituellement, bash est présent mais son loader/librairies dynamiques sont manquants ou brisés.\n\nDiagnostics écrits dans ${LOG}")"
+    fi
+
+    log "Target runtime validation passed with ${CHROOT_SHELL}."
+}
+
+# ── Step 0 : Choose wizard language (always EN/FR shown first) ───────────────
+choose_ui_language() {
+    local choice
+    choice=$(whiptail \
+        --title "VirtuaOS ${VERSION} Installer" \
+        --menu "Choose installer language / Choisissez la langue de l'installateur :" \
+        12 60 2 \
+        "en"  "English" \
+        "fr"  "Français" \
+        3>&1 1>&2 2>&3) || exit 0
+    UI_LANG="${choice}"
+}
+
+# ── Welcome screen ────────────────────────────────────────────────────────────
+welcome() {
+    whiptail \
+        --title "VirtuaOS ${VERSION} Installer" \
+        --yes-button "$(t 'Install' 'Installer')" \
+        --no-button "$(t 'Cancel' 'Annuler')" \
+        --yesno "$(t \
+            "Welcome to VirtuaOS ${VERSION} Installer\n\nThis installer will:\n  • Configure language, keyboard, server name\n  • Erase the internal disk you choose\n  • Copy the system (Virtua pre-installed) to disk\n  • Install GRUB and reboot\n\nUSB drives (install media) are automatically filtered." \
+            "Bienvenue dans l'installateur VirtuaOS ${VERSION}\n\nCet installateur va :\n  • Configurer la langue, le clavier, le nom du serveur\n  • Effacer le disque interne que vous choisirez\n  • Copier le système (Virtua déjà installé) sur le disque\n  • Installer GRUB et redémarrer\n\nLes clés USB (média d'install) sont automatiquement filtrées.")" \
+        18 72 || exit 0
+}
+
+# ── Step 1 : System Language ─────────────────────────────────────────────────
+choose_language() {
+    LANG_CODE=$(whiptail \
+        --title "$(t 'System Language' 'Langue du système')" \
+        --menu "$(t 'Choose the system language:' 'Choisissez la langue du système :')" \
+        18 62 10 \
+        "en_US.UTF-8"  "English (US)" \
+        "en_GB.UTF-8"  "English (UK)" \
+        "fr_FR.UTF-8"  "Français (France)" \
+        "fr_CA.UTF-8"  "Français (Canada)" \
+        "es_ES.UTF-8"  "Español (España)" \
+        "de_DE.UTF-8"  "Deutsch (Deutschland)" \
+        "it_IT.UTF-8"  "Italiano (Italia)" \
+        "pt_BR.UTF-8"  "Português (Brasil)" \
+        "pt_PT.UTF-8"  "Português (Portugal)" \
+        "nl_NL.UTF-8"  "Nederlands" \
+        3>&1 1>&2 2>&3) || exit 0
+}
+
+# ── Step 2 : Keyboard ────────────────────────────────────────────────────────
+choose_keyboard() {
+    KEYMAP=$(whiptail \
+        --title "$(t 'Keyboard Layout' 'Disposition du clavier')" \
+        --menu "$(t 'Choose keyboard layout:' 'Choisissez la disposition du clavier :')" \
+        18 62 10 \
+        "us"        "US (QWERTY)" \
+        "fr"        "Français (AZERTY)" \
+        "ca"        "Canadien Français" \
+        "ca-multix" "Canadien Multilingue" \
+        "es"        "Español" \
+        "de"        "Deutsch (QWERTZ)" \
+        "it"        "Italiano" \
+        "pt-br"     "Português (Brasil)" \
+        "pt"        "Português (Portugal)" \
+        "be"        "Belge" \
+        "ch"        "Suisse / Swiss" \
+        3>&1 1>&2 2>&3) || exit 0
+    loadkeys "${KEYMAP}" 2>/dev/null || true
+}
+
+# ── Step 3 : Hostname ────────────────────────────────────────────────────────
+choose_hostname() {
+    HOSTNAME=$(whiptail \
+        --title "$(t 'Server Name' 'Nom du serveur')" \
+        --inputbox "$(t \
+            'Enter the hostname for this server\n(alphanumeric characters and hyphens only):' \
+            "Entrez le nom d'hôte de ce serveur\n(caractères alphanumériques et tirets uniquement) :")" \
+        10 62 "virtuaos" \
+        3>&1 1>&2 2>&3) || exit 0
+    HOSTNAME="${HOSTNAME,,}"
+    [[ "${HOSTNAME}" =~ ^[a-z0-9][a-z0-9-]{0,62}$ ]] || \
+        die "$(t 'Invalid hostname.' 'Nom dhôte invalide.')"
+}
+
+# ── Step 3b : Timezone ───────────────────────────────────────────────────────
+choose_timezone() {
+    TZ=$(whiptail \
+        --title "$(t 'Timezone' 'Fuseau horaire')" \
+        --menu "$(t 'Choose the system timezone:' 'Choisissez le fuseau horaire :')" \
+        20 70 12 \
+        "UTC"                 "UTC"                                   \
+        "America/Toronto"     "America/Toronto (Eastern, Canada)"     \
+        "America/Montreal"    "America/Montreal (Eastern, Canada)"    \
+        "America/New_York"    "America/New_York (Eastern, USA)"       \
+        "America/Chicago"     "America/Chicago (Central, USA)"        \
+        "America/Denver"      "America/Denver (Mountain, USA)"        \
+        "America/Los_Angeles" "America/Los_Angeles (Pacific, USA)"    \
+        "Europe/Paris"        "Europe/Paris"                          \
+        "Europe/London"       "Europe/London"                         \
+        "Europe/Berlin"       "Europe/Berlin"                         \
+        "Europe/Madrid"       "Europe/Madrid"                         \
+        "Europe/Rome"         "Europe/Rome"                           \
+        "Asia/Tokyo"          "Asia/Tokyo"                            \
+        "Australia/Sydney"    "Australia/Sydney"                      \
+        3>&1 1>&2 2>&3) || exit 0
+}
+
+# One-line network summary (mirrors the Rust wizard) for the confirmation screen.
+net_summary() {
+    if [[ -z "${NET_IFACE}" ]]; then
+        t 'auto (DHCP on default link)' 'auto (DHCP sur le lien par défaut)'
+        return 0
+    fi
+    local s="${NET_IFACE}"
+    [[ "${NET_KIND}" == "wifi" && -n "${WIFI_SSID}" ]] && s+=" · WiFi \"${WIFI_SSID}\""
+    if [[ "${NET_METHOD}" == "static" ]]; then
+        s+=" · ${NET_ADDRESS}"
+        [[ -n "${NET_GATEWAY}" ]] && s+=" gw ${NET_GATEWAY}"
+    else
+        s+=" · DHCP"
+    fi
+    printf '%s' "${s}"
+}
+
+# ── Step 3b : Network ─────────────────────────────────────────────────────────
+# Interactive (whiptail) network setup, parity with the Rust wizard: pick a NIC
+# (Ethernet/WiFi), scan+join a WiFi network, then choose DHCP or a static IP.
+# Sets NET_IFACE/NET_KIND/WIFI_SSID/WIFI_PASSWORD/NET_METHOD/NET_ADDRESS/
+# NET_GATEWAY/NET_DNS — applied later by configure_network(). Skippable.
+choose_network() {
+    local ifaces_raw=""
+    ifaces_raw="$(nmcli -t -f DEVICE,TYPE,STATE device 2>/dev/null \
+        | awk -F: '$2=="ethernet"||$2=="wifi"{print $1"\t"$2"\t"$3}')"
+    if [[ -z "${ifaces_raw}" ]]; then
+        local d n
+        for d in /sys/class/net/*; do
+            n="$(basename "$d")"
+            [[ "$n" == "lo" ]] && continue
+            if [[ -e "$d/wireless" || -e "$d/phy80211" ]]; then
+                ifaces_raw+="${n}"$'\t'"wifi"$'\t'$'\n'
+            elif [[ -e "$d/device" ]]; then
+                ifaces_raw+="${n}"$'\t'"ethernet"$'\t'$'\n'
+            fi
+        done
+    fi
+    if [[ -z "${ifaces_raw}" ]]; then
+        log "No configurable NIC detected; skipping network step"
+        return 0
+    fi
+
+    local menu_args=() dev kind state
+    while IFS=$'\t' read -r dev kind state; do
+        [[ -n "$dev" ]] || continue
+        menu_args+=("$dev" "$(printf '%-9s %s' "$kind" "$state")")
+    done <<< "$(printf '%b' "${ifaces_raw}")"
+
+    NET_IFACE=$(whiptail --title "$(t 'Network interface' 'Interface réseau')" \
+        --cancel-button "$(t 'Skip' 'Passer')" \
+        --menu "$(t 'Select the interface to configure (or Skip for DHCP):' \
+                   'Sélectionnez l’interface à configurer (ou Passer pour DHCP) :')" \
+        18 72 8 "${menu_args[@]}" 3>&1 1>&2 2>&3) || { NET_IFACE=""; return 0; }
+    [[ -n "${NET_IFACE}" ]] || return 0
+
+    NET_KIND="$(printf '%b' "${ifaces_raw}" | awk -F'\t' -v d="${NET_IFACE}" '$1==d{print $2; exit}')"
+    [[ "${NET_KIND}" == "wifi" ]] || NET_KIND="ethernet"
+
+    if [[ "${NET_KIND}" == "wifi" ]]; then
+        command -v rfkill >/dev/null 2>&1 && rfkill unblock all 2>/dev/null || true
+        nmcli device wifi rescan ifname "${NET_IFACE}" >/dev/null 2>&1 || true
+        local wifi_raw ssid sig sec
+        wifi_raw="$(nmcli -t -f SSID,SIGNAL,SECURITY device wifi list ifname "${NET_IFACE}" 2>/dev/null)"
+        local wmenu=()
+        declare -A _seen=()
+        while IFS=: read -r ssid sig sec; do
+            [[ -n "$ssid" ]] || continue
+            [[ -n "${_seen[$ssid]:-}" ]] && continue
+            _seen[$ssid]=1
+            wmenu+=("$ssid" "$(printf 'signal %3s%%  %s' "${sig:-0}" "${sec:-open}")")
+        done <<< "${wifi_raw}"
+        if [[ ${#wmenu[@]} -eq 0 ]]; then
+            whiptail --msgbox "$(t 'No WiFi network found. Falling back to DHCP on this interface.' \
+                                   'Aucun réseau WiFi trouvé. Repli sur DHCP pour cette interface.')" 9 60
+        else
+            WIFI_SSID=$(whiptail --title "$(t 'WiFi networks' 'Réseaux WiFi')" \
+                --menu "$(t 'Select a network:' 'Sélectionnez un réseau :')" 20 72 10 \
+                "${wmenu[@]}" 3>&1 1>&2 2>&3) || { NET_IFACE=""; return 0; }
+            sec="$(echo "${wifi_raw}" | awk -F: -v s="${WIFI_SSID}" '$1==s{print $3; exit}')"
+            if [[ -n "${sec}" && "${sec}" != "--" ]]; then
+                WIFI_PASSWORD=$(whiptail --title "$(t 'WiFi password' 'Mot de passe WiFi')" \
+                    --passwordbox "$(t 'Enter the WiFi password:' 'Entrez le mot de passe WiFi :')" \
+                    10 70 3>&1 1>&2 2>&3) || { NET_IFACE=""; return 0; }
+            fi
+        fi
+    fi
+
+    NET_METHOD=$(whiptail --title "$(t 'Addressing' 'Attribution de l’adresse')" \
+        --menu "$(t 'How should the address be assigned?' 'Comment attribuer l’adresse ?')" 12 70 2 \
+        "dhcp"   "$(t 'Automatic (DHCP)' 'Automatique (DHCP)')" \
+        "static" "$(t 'Static IP (manual)' 'IP fixe (manuelle)')" \
+        3>&1 1>&2 2>&3) || NET_METHOD="dhcp"
+
+    if [[ "${NET_METHOD}" == "static" ]]; then
+        while true; do
+            NET_ADDRESS=$(whiptail --title "$(t 'Static IP' 'IP fixe')" \
+                --inputbox "$(t 'IP address with prefix (e.g. 192.168.1.50/24):' \
+                               'Adresse IP avec préfixe (ex. 192.168.1.50/24) :')" \
+                10 70 "${NET_ADDRESS}" 3>&1 1>&2 2>&3) || return 0
+            [[ "${NET_ADDRESS}" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+/[0-9]+$ ]] && break
+            whiptail --msgbox "$(t 'Invalid address. Use IP/prefix.' 'Adresse invalide. Format IP/préfixe.')" 8 55
+        done
+        NET_GATEWAY=$(whiptail --title "$(t 'Static IP' 'IP fixe')" \
+            --inputbox "$(t 'Gateway (optional):' 'Passerelle (optionnel) :')" \
+            10 70 "${NET_GATEWAY}" 3>&1 1>&2 2>&3) || NET_GATEWAY=""
+        NET_DNS=$(whiptail --title "$(t 'Static IP' 'IP fixe')" \
+            --inputbox "$(t 'DNS servers (space-separated, optional):' \
+                           'Serveurs DNS (séparés par espace, optionnel) :')" \
+            10 70 "1.1.1.1 8.8.8.8" 3>&1 1>&2 2>&3) || NET_DNS=""
+    fi
+}
+
+# ── Step 3c : Passwords ──────────────────────────────────────────────────────
+# Asks for the root shell password and the AuxiNux web panel admin password.
+# Both passwords must be confirmed and meet the same minimum policy as the panel:
+# at least 12 characters, with one letter and one digit.
+prompt_password() {
+    local title="$1"
+    local prompt_main="$2"
+    local pw1 pw2
+    while true; do
+        pw1=$(whiptail --title "${title}" --passwordbox "${prompt_main}" 10 70 \
+              3>&1 1>&2 2>&3) || exit 0
+
+        if (( ${#pw1} < 12 )) || ! [[ "${pw1}" =~ [A-Za-z] ]] || ! [[ "${pw1}" =~ [0-9] ]]; then
+            whiptail --title "${title}" --msgbox "$(t \
+                'Password too weak.\n\nRequirements:\n  • At least 12 characters\n  • At least one letter and one digit' \
+                'Mot de passe trop faible.\n\nExigences :\n  • Au moins 12 caractères\n  • Au moins une lettre et un chiffre')" 12 70
+            continue
+        fi
+
+        pw2=$(whiptail --title "${title}" --passwordbox "$(t 'Confirm password:' 'Confirmez le mot de passe :')" 10 70 \
+              3>&1 1>&2 2>&3) || exit 0
+        if [[ "${pw1}" != "${pw2}" ]]; then
+            whiptail --title "${title}" --msgbox "$(t \
+                'Passwords do not match. Try again.' \
+                'Les mots de passe ne correspondent pas. Réessayez.')" 8 60
+            continue
+        fi
+
+        printf '%s' "${pw1}"
+        return 0
+    done
+}
+
+choose_passwords() {
+    ROOT_PASSWORD=$(prompt_password \
+        "$(t 'Root password (shell)' 'Mot de passe root (shell)')" \
+        "$(t 'Enter a password for the root shell account.\nMin 12 chars, must contain a letter and a digit:' \
+            'Entrez un mot de passe pour le compte root.\nMin 12 caractères, doit contenir une lettre et un chiffre :')")
+
+    ADMIN_PASSWORD=$(prompt_password \
+        "$(t 'Admin password (web panel)' 'Mot de passe admin (panneau web)')" \
+        "$(t 'Enter the initial password for the AuxiNux web panel (admin user).\nSame policy applies:' \
+            'Entrez le mot de passe initial du panneau web AuxiNux (compte admin).\nMême politique :')")
+}
+
+# ── Step 4 : Disk selection ──────────────────────────────────────────────────
+choose_disk() {
+    local disks_raw
+    disks_raw=$(/usr/local/sbin/virtuaos-detect-disks)
+
+    if [[ -z "${disks_raw}" ]]; then
+        die "$(t \
+            'No internal disk detected!\n\nVirtuaOS can only install on internal disks (HDD/SSD/NVMe).\nUSB drives are intentionally filtered to protect your install media.' \
+            "Aucun disque interne détecté !\n\nVirtuaOS ne peut s'installer que sur des disques internes.\nLes clés USB sont filtrées pour protéger votre média d'install.")"
+    fi
+
+    if [[ "${AUTO_MODE}" == "true" ]]; then
+        DISK=$(echo "${disks_raw}" | head -1 | awk '{print $1}')
+        whiptail \
+            --title "$(t 'AUTO mode — Confirm' 'Mode AUTO — Confirmation')" \
+            --yes-button "$(t 'Erase & Install' 'Effacer & Installer')" \
+            --no-button "$(t 'Cancel' 'Annuler')" \
+            --yesno "$(t \
+                "The following disk will be COMPLETELY ERASED:\n\n$(echo "${disks_raw}" | head -1)\n\nAll data will be lost.\n\nContinue?" \
+                "Le disque suivant va être COMPLÈTEMENT EFFACÉ :\n\n$(echo "${disks_raw}" | head -1)\n\nToutes les données seront perdues.\n\nContinuer ?")" \
+            14 72 || exit 0
+    else
+        local options=()
+        while IFS=$'\t' read -r dev size model rest; do
+            options+=("${dev}" "${size}  —  ${model}")
+        done <<< "${disks_raw}"
+
+        DISK=$(whiptail \
+            --title "$(t 'Target Disk' 'Disque cible')" \
+            --menu "$(t \
+                'Choose the internal disk to install VirtuaOS on:\n(only INTERNAL disks listed — USB filtered out)' \
+                "Choisissez le disque interne pour installer VirtuaOS :\n(seuls les disques INTERNES sont listés — clé USB filtrée)")" \
+            18 78 6 "${options[@]}" 3>&1 1>&2 2>&3) || exit 0
+
+        whiptail \
+            --title "$(t 'Last Warning' 'Dernier avertissement')" \
+            --yes-button "$(t 'Erase & Install' 'Effacer & Installer')" \
+            --no-button "$(t 'Cancel' 'Annuler')" \
+            --defaultno \
+            --yesno "$(t \
+                "WARNING — Disk ${DISK} will be COMPLETELY ERASED.\n\nAll existing data will be lost.\n\nAre you sure?" \
+                "ATTENTION — Le disque ${DISK} va être ENTIÈREMENT EFFACÉ.\n\nToutes les données existantes seront perdues.\n\nÊtes-vous sûr ?")" \
+            12 72 || exit 0
+    fi
+
+    [[ -b "${DISK}" ]] || die "$(t 'Disk' 'Disque') ${DISK} $(t 'not found.' 'introuvable.')"
+}
+
+# ── Step 5 : Partition + format ──────────────────────────────────────────────
+# Wait for a block device node to actually appear (udev can lag behind
+# partprobe). Returns non-zero if it never shows up.
+wait_for_dev() {
+    local dev="$1" i
+    for i in $(seq 1 20); do
+        [[ -b "${dev}" ]] && return 0
+        command -v udevadm >/dev/null 2>&1 && udevadm settle --timeout=2 2>/dev/null || true
+        sleep 0.5
+    done
+    [[ -b "${dev}" ]]
+}
+
+# Run mkfs with retries. Right after (re)partitioning, udev fires a blkid scan
+# on the freshly-created node; mkfs racing that scan fails with "Device or
+# resource busy". Rebooting used to clear it — settling + retrying removes that
+# need so the install succeeds on the first boot.
+run_mkfs() {
+    local i rc=0
+    for i in 1 2 3 4 5; do
+        if "$@" >>"${LOG}" 2>&1; then return 0; fi
+        rc=$?
+        log "mkfs attempt ${i} failed (rc=${rc}): $* — settling then retrying"
+        swapoff -a 2>/dev/null || true
+        command -v udevadm >/dev/null 2>&1 && udevadm settle --timeout=5 2>/dev/null || true
+        sleep 2
+    done
+    die "$(t 'Failed to format (device busy):' 'Échec du formatage (périphérique occupé) :') $*"
+}
+
+partition_and_format() {
+    progress 2 "$(t 'Unmounting existing partitions...' 'Démontage des partitions existantes...')" "${DISK}"
+    # 1. Release anything holding the target disk. The live media frequently
+    #    auto-activates swap/LVM/MD found on the target — that is exactly what
+    #    later makes the new partition appear "in use" during mkfs.
+    swapoff -a 2>/dev/null || true
+    for mp in $(lsblk -ln -o MOUNTPOINT "${DISK}" 2>/dev/null | grep -v '^$' | sort -r); do
+        umount -lf "${mp}" 2>/dev/null || true
+    done
+    for part in $(lsblk -ln -o PATH "${DISK}" 2>/dev/null | tail -n +2); do
+        swapoff "${part}" 2>/dev/null || true
+        umount -lf "${part}" 2>/dev/null || true
+    done
+    # Tear down stale LVM / MD / device-mapper sitting on the disk.
+    command -v vgchange >/dev/null 2>&1 && vgchange -an 2>/dev/null || true
+    if command -v mdadm >/dev/null 2>&1; then
+        for md in $(lsblk -lnp -o NAME,TYPE "${DISK}" 2>/dev/null | awk '$2=="raid"||$2=="md"{print $1}'); do
+            mdadm --stop "${md}" 2>/dev/null || true
+        done
+    fi
+    command -v dmsetup >/dev/null 2>&1 && dmsetup remove_all 2>/dev/null || true
+
+    progress 5 "$(t 'Creating GPT partition table...' 'Création de la table GPT...')" "${DISK}"
+    # Wipe FS signatures on every child partition THEN the whole disk, so udev
+    # does not immediately re-probe/auto-assemble a stale FS/RAID/LVM member.
+    for part in $(lsblk -ln -o PATH "${DISK}" 2>/dev/null | tail -n +2); do
+        wipefs -a "${part}" 2>/dev/null || true
+    done
+    wipefs -a "${DISK}" 2>/dev/null || true
+    sgdisk --zap-all "${DISK}" 2>/dev/null || true
+    blockdev --rereadpt "${DISK}" 2>/dev/null || true
+    command -v udevadm >/dev/null 2>&1 && udevadm settle --timeout=10 2>/dev/null || true
+
+    progress 8 "$(t 'Creating partitions (EFI + root)...' 'Création des partitions (EFI + root)...')" "${DISK}"
+    # Layout: 1=EFI 512MiB  2=BIOS-boot 1MiB  3=root (rest)
+    sgdisk \
+        -n 1:0:+512M -t 1:ef00 -c 1:"EFI" \
+        -n 2:0:+1M   -t 2:ef02 -c 2:"BIOSboot" \
+        -n 3:0:0     -t 3:8300 -c 3:"VirtuaOS" \
+        "${DISK}"
+
+    # Re-read the new table and WAIT for udev to create AND release the nodes.
+    partprobe "${DISK}" 2>/dev/null || true
+    blockdev --rereadpt "${DISK}" 2>/dev/null || true
+    command -v udevadm >/dev/null 2>&1 && udevadm settle --timeout=15 2>/dev/null || true
+
+    # Determine partition names (NVMe = pN suffix)
+    if [[ "${DISK}" =~ nvme|mmcblk|loop ]]; then
+        EFI_PART="${DISK}p1"
+        ROOT_PART="${DISK}p3"
+    else
+        EFI_PART="${DISK}1"
+        ROOT_PART="${DISK}3"
+    fi
+
+    # Make sure the kernel actually exposed the new nodes before formatting.
+    wait_for_dev "${EFI_PART}"  || die "$(t 'Partition not found:' 'Partition introuvable :') ${EFI_PART}"
+    wait_for_dev "${ROOT_PART}" || die "$(t 'Partition not found:' 'Partition introuvable :') ${ROOT_PART}"
+
+    progress 12 "$(t 'Formatting EFI partition (FAT32)...' 'Formatage partition EFI (FAT32)...')" "${EFI_PART}"
+    run_mkfs mkfs.fat -F32 -n EFI "${EFI_PART}"
+
+    progress 16 "$(t 'Formatting root partition (ext4)...' 'Formatage partition root (ext4)...')" "${ROOT_PART}"
+    run_mkfs mkfs.ext4 -F -L VirtuaOS "${ROOT_PART}"
+
+    progress 20 "$(t 'Mounting partitions...' 'Montage des partitions...')" "${TARGET}"
+    mkdir -p "${TARGET}"
+    mount "${ROOT_PART}" "${TARGET}"
+    mkdir -p "${TARGET}/boot/efi"
+    mount "${EFI_PART}" "${TARGET}/boot/efi"
+}
+
+# ── Step 6 : Copy live filesystem to target ──────────────────────────────────
+copy_system() {
+    # Count files for ETA display (quick estimate)
+    progress 22 "$(t 'Counting files to copy...' 'Comptage des fichiers à copier...')" ""
+    local total_files
+    total_files=$(find / \
+        -not -path '/proc/*' -not -path '/sys/*' -not -path '/dev/*' \
+        -not -path '/run/*'  -not -path '/mnt/*' -not -path '/cdrom/*' \
+        -not -path '/lib/live/mount/*' \
+        2>/dev/null | wc -l || echo "?")
+
+    progress 25 "$(t 'Copying system files...' 'Copie des fichiers système...')" \
+        "$(t "~${total_files} files — this takes 3-8 minutes" "~${total_files} fichiers — cela prend 3 à 8 minutes")"
+
+    # Run rsync in background. CRITICAL: exclude lxcfs (FUSE) — it generates
+    # thousands of "No data available" errors that can mask real problems.
+    rsync -aAXH \
+        --ignore-errors \
+        --ignore-missing-args \
+        --exclude='/proc'    --exclude='/proc/*' \
+        --exclude='/sys'     --exclude='/sys/*' \
+        --exclude='/dev'     --exclude='/dev/*' \
+        --exclude='/run'     --exclude='/run/*' \
+        --exclude='/tmp'     --exclude='/tmp/*' \
+        --exclude='/mnt'     --exclude='/mnt/*' \
+        --exclude='/media'   --exclude='/media/*' \
+        --exclude='/lost+found' \
+        --exclude='/cdrom'   --exclude='/cdrom/*' \
+        --exclude='/lib/live' --exclude='/lib/live/*' \
+        --exclude='/var/lib/lxcfs' --exclude='/var/lib/lxcfs/*' \
+        --exclude='/var/lib/lxd' --exclude='/var/lib/lxd/*' \
+        --exclude='/var/log/*' \
+        --exclude='/var/cache/apt/archives/*.deb' \
+        --exclude='/var/lib/apt/lists/*' \
+        --exclude='/home/virtua/.bash_history' \
+        --exclude='/root/.bash_history' \
+        --exclude='/etc/machine-id' \
+        --exclude='/var/lib/dbus/machine-id' \
+        --exclude='/etc/ssh/ssh_host_*' \
+        --exclude='/etc/virtuaos/.firstboot-done' \
+        --exclude='/var/lib/auxinuxvirtual/db/*' \
+        / "${TARGET}/" >> "${LOG}" 2>&1 &
+    local rsync_pid=$!
+
+    # Show live progress while rsync runs
+    local dot=0
+    local dots=("." ".." "...")
+    while kill -0 "${rsync_pid}" 2>/dev/null; do
+        local written_mb=0
+        written_mb=$(du -sm "${TARGET}" 2>/dev/null | cut -f1 || echo 0)
+        local pct=$(( 25 + written_mb * 47 / 3000 ))
+        [[ ${pct} -gt 72 ]] && pct=72
+        progress ${pct} \
+            "$(t 'Copying system files...' 'Copie des fichiers système...')" \
+            "$(t "${written_mb} MB written${dots[$dot]}" "${written_mb} Mo copiés${dots[$dot]}")"
+        dot=$(( (dot + 1) % 3 ))
+        sleep 4
+    done
+
+    # rsync exit codes: 0=ok, 23=partial (some files skipped), 24=vanished files
+    # Both 23 and 24 are NORMAL for a live copy — not fatal
+    set +e
+    wait "${rsync_pid}"
+    local rsync_exit=$?
+    set -e
+    if [[ ${rsync_exit} -ne 0 && ${rsync_exit} -ne 23 && ${rsync_exit} -ne 24 ]]; then
+        die "$(t "rsync failed (code ${rsync_exit}) — check" "Erreur rsync (code ${rsync_exit}) — voir") ${LOG}"
+    fi
+    log "rsync done (exit=${rsync_exit})"
+
+    # Flush the freshly-written target to disk before any sanity check. After a
+    # multi-GB rsync the dentry/page cache for the new filesystem can be cold, and
+    # this live environment intermittently returns false on a stat()/-x of files
+    # that ARE present (root cause behind the spurious "bash/grub-install missing"
+    # and chroot exec failures). A sync settles that.
+    sync
+    command -v udevadm >/dev/null 2>&1 && udevadm settle --timeout=10 2>/dev/null || true
+
+    progress 73 "$(t 'File copy complete.' 'Copie des fichiers terminée.')" ""
+    log "Copy done."
+
+    # Recreate excluded dirs as empty
+    mkdir -p "${TARGET}"/{proc,sys,dev,run,tmp,mnt,media,cdrom}
+    chmod 1777 "${TARGET}/tmp"
+
+    # Critical: ensure essential directories exist (rsync may have skipped some
+    # due to errors). Create them so symlinks/configs in configure_target work.
+    mkdir -p "${TARGET}/var/lib/dbus"
+    mkdir -p "${TARGET}/var/lib/lxcfs"
+    mkdir -p "${TARGET}/var/log"
+    mkdir -p "${TARGET}/etc/systemd/system"
+    mkdir -p "${TARGET}/etc/virtuaos"
+    mkdir -p "${TARGET}/boot/efi"
+    mkdir -p "${TARGET}/boot/grub"
+
+    # Repair usr-merge links before checking critical binaries. On Debian 13,
+    # /bin is normally a symlink to /usr/bin; a copied target with /usr/bin/bash
+    # but a missing/broken /bin link must be repaired, not rejected prematurely.
+    repair_merged_usr_links
+
+    # Sanity check: essential binaries must be present
+    if [[ ! -x "${TARGET}/bin/bash" && ! -x "${TARGET}/usr/bin/bash" ]]; then
+        die "$(t \
+            "Critical file missing in target: bash\nrsync did not copy the system correctly. Check ${LOG}" \
+            "Fichier critique manquant : bash\nrsync n'a pas copié le système correctement. Voir ${LOG}")"
+    fi
+    for bin in /usr/bin/env /usr/sbin/grub-install; do
+        if [[ ! -e "${TARGET}${bin}" ]]; then
+            die "$(t \
+                "Critical file missing in target: ${bin}\nrsync did not copy the system correctly. Check ${LOG}" \
+                "Fichier critique manquant : ${bin}\nrsync n'a pas copié le système correctement. Voir ${LOG}")"
+        fi
+    done
+
+    validate_target_runtime
+
+    log "Essential directories created and sanity checks passed."
+}
+
+# ── Step 7 : Configure target system ─────────────────────────────────────────
+# Helper: bind-mount only if not already mounted
+safe_bind() {
+    local src="$1" dst="$2"
+    mkdir -p "${dst}"
+    mountpoint -q "${dst}" || mount --bind "${src}" "${dst}"
+}
+
+# Run a command inside the target chroot, resilient to a TRANSIENT
+# "chroot: failed to run command '/bin/bash': No such file or directory" that can
+# hit the FIRST chroot right after the bind mounts in a live session. The target
+# itself is intact (a cold post-install chroot works every time, and the pre-bind
+# validation chroot passes) — the failure is the live mount/device state not
+# having settled. We sync + settle + retry, and send all output to the log
+# instead of leaking a fatal error to the console. Returns non-zero only if the
+# chroot still cannot run after several attempts (then diagnostics are logged).
+chroot_target() {
+    local script="$1" attempt rc
+    for attempt in 1 2 3 4 5; do
+        if chroot "${TARGET}" "${CHROOT_SHELL}" -c "${script}" >> "${LOG}" 2>&1; then
+            [[ ${attempt} -gt 1 ]] && log "target chroot succeeded on attempt ${attempt}"
+            return 0
+        fi
+        rc=$?
+        log "WARN: target chroot exec failed (attempt ${attempt}/5, rc=${rc}); sync+settle then retry"
+        sync
+        command -v udevadm >/dev/null 2>&1 && udevadm settle --timeout=5 2>/dev/null || true
+        sleep 1
+        # Defensive: re-resolve a working shell in the target.
+        if   [[ -x "${TARGET}/bin/bash"     ]]; then CHROOT_SHELL="/bin/bash"
+        elif [[ -x "${TARGET}/usr/bin/bash" ]]; then CHROOT_SHELL="/usr/bin/bash"
+        elif [[ -x "${TARGET}/bin/sh"       ]]; then CHROOT_SHELL="/bin/sh"
+        fi
+    done
+    log_target_runtime_diagnostics
+    return 1
+}
+
+# Write a persistent NetworkManager connection profile into the TARGET so the
+# installed system boots with the network the user chose (wired/wifi, DHCP or
+# static). Deterministic: we write the keyfile directly rather than relying on
+# nmcli running against the target. No-op if the wizard captured no interface.
+configure_network() {
+    [[ -n "${NET_IFACE}" ]] || { log "Network: keeping default (DHCP on live link)"; return 0; }
+
+    progress 79 "$(t 'Writing network configuration...' 'Écriture de la configuration réseau...')" "${NET_IFACE}"
+
+    local nmdir="${TARGET}/etc/NetworkManager/system-connections"
+    mkdir -p "${nmdir}"
+    local conn_id="virtuaos-${NET_IFACE}"
+    local file="${nmdir}/${conn_id}.nmconnection"
+    local uuid; uuid="$(cat /proc/sys/kernel/random/uuid 2>/dev/null || true)"
+
+    {
+        echo "[connection]"
+        echo "id=${conn_id}"
+        [[ -n "${uuid}" ]] && echo "uuid=${uuid}"
+        echo "type=${NET_KIND}"
+        echo "interface-name=${NET_IFACE}"
+        echo "autoconnect=true"
+        echo ""
+        if [[ "${NET_KIND}" == "wifi" ]]; then
+            echo "[wifi]"
+            echo "mode=infrastructure"
+            echo "ssid=${WIFI_SSID}"
+            echo ""
+            if [[ -n "${WIFI_PASSWORD}" ]]; then
+                echo "[wifi-security]"
+                echo "key-mgmt=wpa-psk"
+                echo "psk=${WIFI_PASSWORD}"
+                echo ""
+            fi
+        fi
+        echo "[ipv4]"
+        if [[ "${NET_METHOD}" == "static" && -n "${NET_ADDRESS}" ]]; then
+            echo "method=manual"
+            if [[ -n "${NET_GATEWAY}" ]]; then
+                echo "address1=${NET_ADDRESS},${NET_GATEWAY}"
+            else
+                echo "address1=${NET_ADDRESS}"
+            fi
+            if [[ -n "${NET_DNS}" ]]; then
+                # NM wants ';'-separated DNS; accept space/comma input.
+                local dns; dns="$(echo "${NET_DNS}" | tr ', ' '\n' | sed '/^$/d' | paste -sd ';' -)"
+                [[ -n "${dns}" ]] && echo "dns=${dns};"
+            fi
+        else
+            echo "method=auto"
+        fi
+        echo ""
+        echo "[ipv6]"
+        echo "method=auto"
+    } > "${file}"
+    chmod 0600 "${file}"
+    log "Network profile written: ${file} (kind=${NET_KIND} method=${NET_METHOD})"
+
+    # Ensure NetworkManager manages the device and is enabled on the target.
+    mkdir -p "${TARGET}/etc/NetworkManager/conf.d"
+    cat > "${TARGET}/etc/NetworkManager/conf.d/10-virtuaos-manage.conf" <<EOF
+[keyfile]
+unmanaged-devices=none
+EOF
+    chroot_target "systemctl enable NetworkManager.service >/dev/null 2>&1 || true" \
+        || log "WARN: could not enable NetworkManager in target (non-fatal)"
+
+    # Unblock any soft-blocked WiFi radio so it comes up on first boot.
+    if [[ "${NET_KIND}" == "wifi" ]]; then
+        command -v rfkill >/dev/null 2>&1 && rfkill unblock all 2>/dev/null || true
+    fi
+}
+
+configure_target() {
+    progress 76 "$(t 'Configuring system (hostname, locale, keyboard)...' 'Configuration du système (hostname, locale, clavier)...')" ""
+
+    # Bind mounts for chroot — safe (idempotent) versions
+    safe_bind /dev     "${TARGET}/dev"
+    safe_bind /dev/pts "${TARGET}/dev/pts"
+    safe_bind /proc    "${TARGET}/proc"
+    safe_bind /sys     "${TARGET}/sys"
+    safe_bind /run     "${TARGET}/run"
+
+    # EFI vars for grub-install in UEFI mode
+    if [[ -d /sys/firmware/efi/efivars ]]; then
+        safe_bind /sys/firmware/efi/efivars "${TARGET}/sys/firmware/efi/efivars" 2>/dev/null || true
+    fi
+
+    # Flush the freshly-copied filesystem and let the bind mounts / udev settle
+    # BEFORE the first chroot. This is what prevents the intermittent
+    # "chroot: failed to run command '/bin/bash'" at this exact step (the target
+    # is intact; the live mount state just needs a moment to settle).
+    sync
+    command -v udevadm >/dev/null 2>&1 && udevadm settle --timeout=10 2>/dev/null || true
+
+    # Hostname
+    echo "${HOSTNAME}" > "${TARGET}/etc/hostname"
+    cat > "${TARGET}/etc/hosts" <<EOF
+127.0.0.1   localhost
+127.0.1.1   ${HOSTNAME}.local ${HOSTNAME}
+::1         localhost ip6-localhost ip6-loopback
+ff02::1     ip6-allnodes
+ff02::2     ip6-allrouters
+EOF
+
+    printf '%s\n' "${VERSION%%-*}" > "${TARGET}/etc/virtuaos-version"
+    chmod 0644 "${TARGET}/etc/virtuaos-version"
+    log "VirtuaOS release marker written: ${VERSION%%-*}"
+
+    # Locale — write the file directly (no chroot needed; update-locale only edits
+    # this same file) so the very first config step never depends on chroot.
+    cat > "${TARGET}/etc/default/locale" <<EOF
+LANG=${LANG_CODE}
+LC_ALL=${LANG_CODE}
+EOF
+    # Then refresh the locale DB inside the target, resiliently.
+    chroot_target "update-locale LANG=${LANG_CODE} LC_ALL=${LANG_CODE} >/dev/null 2>&1 || true" \
+        || log "WARN: update-locale in target had issues (locale file already written, non-fatal)"
+
+    # Keyboard
+    cat > "${TARGET}/etc/default/keyboard" <<EOF
+XKBMODEL="pc105"
+XKBLAYOUT="${KEYMAP%%-*}"
+XKBVARIANT="$(echo "${KEYMAP}" | grep -- - | cut -d- -f2 || true)"
+XKBOPTIONS=""
+BACKSPACE="guess"
+EOF
+
+    # Timezone
+    if [[ -n "${TZ}" && -e "${TARGET}/usr/share/zoneinfo/${TZ}" ]]; then
+        ln -sf "/usr/share/zoneinfo/${TZ}" "${TARGET}/etc/localtime"
+        echo "${TZ}" > "${TARGET}/etc/timezone"
+        log "Timezone set to ${TZ}"
+    fi
+
+    # Root password — use `chpasswd --root` (operates on the target WITHOUT a
+    # chroot), so password setting doesn't depend on the post-bind chroot state.
+    if [[ -n "${ROOT_PASSWORD}" ]]; then
+        printf 'root:%s\n' "${ROOT_PASSWORD}" | chpasswd --root "${TARGET}" >> "${LOG}" 2>&1 \
+            && log "Root password set" \
+            || log "WARN: failed to set root password"
+    fi
+    # Also set the virtua shell user password (was admin123 in the live image).
+    # Check the target's passwd file directly instead of `chroot id`.
+    if [[ -n "${ROOT_PASSWORD}" ]] && grep -q "^virtua:" "${TARGET}/etc/passwd" 2>/dev/null; then
+        printf 'virtua:%s\n' "${ROOT_PASSWORD}" | chpasswd --root "${TARGET}" >> "${LOG}" 2>&1 \
+            && log "Shell user virtua password set" \
+            || log "WARN: failed to set virtua user password"
+    fi
+
+    # AuxiNux web panel admin password — write to a one-shot seed file consumed
+    # at first boot by virtuaos-firstboot before the API starts the DB.
+    if [[ -n "${ADMIN_PASSWORD}" ]]; then
+        mkdir -p "${TARGET}/etc/virtuaos"
+        umask 077
+        printf '%s' "${ADMIN_PASSWORD}" > "${TARGET}/etc/virtuaos/admin-password.seed"
+        chmod 0600 "${TARGET}/etc/virtuaos/admin-password.seed"
+        log "Admin panel password seed written"
+    fi
+
+    # Persist the chosen network (wired/wifi, DHCP/static) into the target.
+    configure_network
+
+    # Empty machine-id (regen on first boot)
+    : > "${TARGET}/etc/machine-id"
+    mkdir -p "${TARGET}/var/lib/dbus"   # be defensive
+    rm -f "${TARGET}/var/lib/dbus/machine-id"
+    ln -sf /etc/machine-id "${TARGET}/var/lib/dbus/machine-id" 2>/dev/null || \
+        log "  WARN: could not symlink machine-id (non-fatal)"
+
+    # fstab
+    local root_uuid efi_uuid
+    root_uuid="$(blkid -s UUID -o value "${ROOT_PART}")"
+    efi_uuid="$(blkid -s UUID -o value "${EFI_PART}")"
+    cat > "${TARGET}/etc/fstab" <<EOF
+# /etc/fstab — generated by VirtuaOS installer
+UUID=${root_uuid}  /          ext4  errors=remount-ro  0  1
+UUID=${efi_uuid}   /boot/efi  vfat  umask=0077         0  1
+tmpfs              /tmp       tmpfs defaults,nosuid    0  0
+EOF
+
+    # ── apt sources → AuxiNux Debian mirror ──────────────────────────────────
+    # The INSTALLED system pulls Debian from the AuxiNux mirror instead of
+    # deb.debian.org. We do this here (on the target) rather than via live-build's
+    # --mirror-binary on purpose: --mirror-binary makes live-build run apt-get
+    # update against the mirror DURING THE BUILD, and that mirror is binary-only
+    # (no Sources indices, partial components) so the build 404s and dies. Writing
+    # the sources straight onto the target keeps the build entirely on
+    # deb.debian.org while the installed system uses the mirror.
+    #
+    # The mirror is signed with the stock Debian archive key, so no extra keyring
+    # is needed. Types: deb only (no deb-src) — the mirror has no source indices.
+    # The mirror lives at /DEBIAN (single tree: trixie + -updates + -security all
+    # served under one URI), matching scripts/install-auxinux-sources-DEB.sh.
+    # NOTE: the path is case-sensitive — the old lowercase /debian + /debian-security
+    # layout was retired in the depot rebuild and now 404s ("Release not found").
+    : > "${TARGET}/etc/apt/sources.list"
+    rm -f "${TARGET}/etc/apt/sources.list.d/debian.list"
+    mkdir -p "${TARGET}/etc/apt/sources.list.d"
+    cat > "${TARGET}/etc/apt/sources.list.d/debian.sources" <<'EOF'
+Types: deb
+URIs: https://dep.auxinux.ca/DEBIAN
+Suites: trixie trixie-updates trixie-security
+Components: main contrib non-free non-free-firmware
+Architectures: amd64
+Signed-By: /usr/share/keyrings/debian-archive-keyring.gpg
+EOF
+    log "apt sources set to AuxiNux mirror (dep.auxinux.ca/DEBIAN)"
+
+    # Disable autologin on installed system (only for live)
+    rm -f "${TARGET}/etc/systemd/system/getty@tty1.service.d/autologin.conf"
+    rmdir "${TARGET}/etc/systemd/system/getty@tty1.service.d" 2>/dev/null || true
+
+    # Remove .bash_profile auto-installer hook
+    rm -f "${TARGET}/home/virtua/.bash_profile"
+    cat > "${TARGET}/home/virtua/.bash_profile" <<'EOF'
+[[ -f ~/.bashrc ]] && source ~/.bashrc
+EOF
+    chown 1000:1000 "${TARGET}/home/virtua/.bash_profile" 2>/dev/null || true
+
+    progress 82 "$(t 'Enabling services (Docker, libvirt, Virtua)...' 'Activation des services (Docker, libvirt, Virtua)...')" ""
+    # Re-enable Docker on the installed system (was masked in live mode).
+    # Use `systemctl --root` (manipulates the target's symlinks OFFLINE, no chroot)
+    # so this never depends on the post-bind chroot state. All best-effort.
+    {
+        systemctl --root="${TARGET}" disable docker-live-disable.service 2>/dev/null || true
+        rm -f "${TARGET}/etc/systemd/system/docker-live-disable.service"
+        systemctl --root="${TARGET}" unmask docker.service containerd.service 2>/dev/null || true
+        systemctl --root="${TARGET}" enable docker.service containerd.service 2>/dev/null || true
+    } >> "${LOG}" 2>&1 || log "  (some service enables had warnings — non-fatal)"
+
+    # Restore kernel log level on installed system
+    cat > "${TARGET}/etc/sysctl.d/10-console-messages.conf" <<'EOF'
+kernel.printk = 4 4 1 7
+EOF
+
+    rm -f "${TARGET}/etc/systemd/system/docker.service.live-mask" 2>/dev/null || true
+
+    # Validate kernel + initrd are present (required for GRUB to find them)
+    if [[ ! -f "${TARGET}/boot/vmlinuz" && ! -f "${TARGET}/boot/vmlinuz-"* ]] 2>/dev/null; then
+        # Try to find any kernel
+        local kernels
+        kernels="$(ls "${TARGET}/boot/"vmlinuz* 2>/dev/null || true)"
+        if [[ -z "${kernels}" ]]; then
+            die "$(t \
+                "No kernel found in ${TARGET}/boot/\nThe live system did not copy the kernel correctly." \
+                "Aucun noyau trouvé dans ${TARGET}/boot/\nLe système live n'a pas copié le noyau correctement.")"
+        fi
+        log "Kernels found: $(echo "${kernels}" | tr '\n' ' ')"
+    fi
+
+    progress 85 "$(t 'System configuration done.' 'Configuration système terminée.')" ""
+    log "Target configured."
+}
+
+# ── Step 8 : Install GRUB ────────────────────────────────────────────────────
+install_grub() {
+    local efi_mode=false
+    [[ -d /sys/firmware/efi ]] && efi_mode=true
+
+    log "GRUB install: efi_mode=${efi_mode} disk=${DISK}"
+
+    # Presence check — RESILIENT, not fatal. This live environment can spuriously
+    # fail a stat()/-x test on a binary that is genuinely present and executable
+    # in the target (confirmed: /mnt/target/usr/sbin/grub-install is -rwxr-xr-x
+    # yet a single [[ -x ]] returned false and killed the install). Retry with a
+    # sync; if it STILL can't be seen, do NOT die — grub-install runs via
+    # chroot_target below (with its own retries) and will surface a real failure.
+    local _gi_attempt
+    for _gi_attempt in 1 2 3 4 5; do
+        [[ -x "${TARGET}/usr/sbin/grub-install" ]] && break
+        log "WARN: grub-install not visible in target (attempt ${_gi_attempt}/5); sync+retry"
+        sync
+        command -v udevadm >/dev/null 2>&1 && udevadm settle --timeout=5 2>/dev/null || true
+        sleep 1
+    done
+    if [[ ! -x "${TARGET}/usr/sbin/grub-install" ]]; then
+        log "WARN: grub-install still not visible after retries — attempting install anyway"
+    fi
+
+    # Try BIOS install first — this works on both BIOS and most UEFI machines
+    # and gives us a reliable fallback even when EFI fails
+    progress 87 "$(t 'Installing GRUB BIOS bootloader...' 'Installation GRUB BIOS...')" "${DISK}"
+    if ! chroot_target "grub-install --target=i386-pc --recheck --no-floppy ${DISK}"; then
+        log "  WARN: BIOS grub-install failed (this is OK on pure UEFI systems)"
+    fi
+
+    # If EFI: install EFI grub
+    if ${efi_mode}; then
+        progress 89 "$(t 'Installing GRUB EFI bootloader...' 'Installation GRUB EFI...')" "${DISK}"
+
+        # Make sure the EFI dir exists (host-side, no chroot needed)
+        [[ -d "${TARGET}/boot/efi/EFI" ]] || mkdir -p "${TARGET}/boot/efi/EFI" 2>/dev/null || true
+
+        # Try with --removable as fallback (writes to BOOTX64.EFI which always boots)
+        if ! chroot_target "grub-install --target=x86_64-efi --efi-directory=/boot/efi --bootloader-id=VirtuaOS --recheck --no-floppy"; then
+            log "  WARN: EFI grub-install (registered) failed — trying --removable"
+            chroot_target "grub-install --target=x86_64-efi --efi-directory=/boot/efi --bootloader-id=VirtuaOS --removable --recheck --no-floppy" || \
+                log "  WARN: EFI --removable also failed"
+        fi
+
+        # Manual fallback: copy grubx64.efi to /EFI/BOOT/BOOTX64.EFI (firmware default path)
+        if [[ -f "${TARGET}/boot/efi/EFI/VirtuaOS/grubx64.efi" ]]; then
+            mkdir -p "${TARGET}/boot/efi/EFI/BOOT"
+            cp -f "${TARGET}/boot/efi/EFI/VirtuaOS/grubx64.efi" \
+                  "${TARGET}/boot/efi/EFI/BOOT/BOOTX64.EFI" 2>/dev/null || true
+        elif [[ -f "${TARGET}/boot/efi/EFI/debian/grubx64.efi" ]]; then
+            mkdir -p "${TARGET}/boot/efi/EFI/BOOT"
+            cp -f "${TARGET}/boot/efi/EFI/debian/grubx64.efi" \
+                  "${TARGET}/boot/efi/EFI/BOOT/BOOTX64.EFI" 2>/dev/null || true
+        fi
+    fi
+
+    progress 93 "$(t 'Generating GRUB config (VirtuaOS branding)...' 'Génération config GRUB (branding VirtuaOS)...')" ""
+
+    cat > "${TARGET}/etc/default/grub" <<'EOF'
+GRUB_DEFAULT=0
+GRUB_TIMEOUT=5
+GRUB_DISTRIBUTOR="VirtuaOS"
+GRUB_CMDLINE_LINUX_DEFAULT="quiet"
+GRUB_CMDLINE_LINUX=""
+GRUB_DISABLE_OS_PROBER=true
+EOF
+
+    if ! chroot_target "update-grub"; then
+        log "  WARN: update-grub failed — generating minimal grub.cfg manually"
+        # Manual fallback grub.cfg pointing to the kernel/initrd
+        local kernel initrd
+        kernel="$(ls "${TARGET}/boot/"vmlinuz-* 2>/dev/null | head -1 | xargs -n1 basename || echo vmlinuz)"
+        initrd="$(ls "${TARGET}/boot/"initrd.img-* 2>/dev/null | head -1 | xargs -n1 basename || echo initrd.img)"
+        local root_uuid
+        root_uuid="$(blkid -s UUID -o value "${ROOT_PART}")"
+
+        mkdir -p "${TARGET}/boot/grub"
+        cat > "${TARGET}/boot/grub/grub.cfg" <<GRUBCFG
+set default=0
+set timeout=5
+insmod part_gpt
+insmod ext2
+
+menuentry "VirtuaOS ${VERSION}" {
+    search --no-floppy --fs-uuid --set=root ${root_uuid}
+    linux  /boot/${kernel} root=UUID=${root_uuid} ro quiet
+    initrd /boot/${initrd}
+}
+GRUBCFG
+        log "  Manual grub.cfg generated."
+    fi
+
+    # Patch generated grub.cfg for VirtuaOS branding
+    if [[ -f "${TARGET}/boot/grub/grub.cfg" ]]; then
+        sed -i \
+            -e "s|Debian GNU/Linux|VirtuaOS ${VERSION}|g" \
+            -e "s|Debian Trixie|VirtuaOS ${VERSION}|g" \
+            "${TARGET}/boot/grub/grub.cfg"
+    fi
+
+    # Final verification
+    if [[ ! -f "${TARGET}/boot/grub/grub.cfg" ]]; then
+        die "$(t \
+            'GRUB config not generated. The system will not boot.' \
+            'Config GRUB pas générée. Le système ne démarrera pas.')"
+    fi
+
+    progress 97 "$(t 'GRUB installed.' 'GRUB installé.')" ""
+    log "GRUB done."
+}
+
+# ── Step 9 : Cleanup ─────────────────────────────────────────────────────────
+finalize() {
+    progress 98 "$(t 'Unmounting filesystems...' 'Démontage des systèmes de fichiers...')" ""
+    log "Unmounting..."
+    sync
+    umount -lf "${TARGET}/dev/pts" 2>/dev/null || true
+    umount -lf "${TARGET}/dev"     2>/dev/null || true
+    umount -lf "${TARGET}/proc"    2>/dev/null || true
+    umount -lf "${TARGET}/sys"     2>/dev/null || true
+    umount -lf "${TARGET}/run"     2>/dev/null || true
+    umount -lf "${TARGET}/boot/efi" 2>/dev/null || true
+    umount -lf "${TARGET}"         2>/dev/null || true
+}
+
+# ── Main flow ─────────────────────────────────────────────────────────────────
+mkdir -p /var/log
+: > "${LOG}"
+
+# Backend mode reads every answer from CONF_FILE (written by the Rust front-end)
+# instead of asking via whiptail. Known keys only; the value is everything after
+# the first '=' so passwords may contain '='. The file is removed once loaded.
+load_answers() {
+    [[ -f "${CONF_FILE}" ]] || die "config file ${CONF_FILE} not found"
+    local key val
+    while IFS='=' read -r key val; do
+        case "${key}" in
+            ui_lang)        UI_LANG="${val}" ;;
+            lang_code)      LANG_CODE="${val}" ;;
+            keymap)         KEYMAP="${val}" ;;
+            hostname)       HOSTNAME="${val}" ;;
+            tz)             TZ="${val}" ;;
+            disk)           DISK="${val}" ;;
+            net_iface)      NET_IFACE="${val}" ;;
+            net_kind)       NET_KIND="${val}" ;;
+            wifi_ssid)      WIFI_SSID="${val}" ;;
+            wifi_password)  WIFI_PASSWORD="${val}" ;;
+            net_method)     NET_METHOD="${val}" ;;
+            net_address)    NET_ADDRESS="${val}" ;;
+            net_gateway)    NET_GATEWAY="${val}" ;;
+            net_dns)        NET_DNS="${val}" ;;
+            root_password)  ROOT_PASSWORD="${val}" ;;
+            admin_password) ADMIN_PASSWORD="${val}" ;;
+        esac
+    done < "${CONF_FILE}"
+    [[ -b "${DISK}" ]] || die "disk ${DISK} not found"
+    rm -f "${CONF_FILE}" 2>/dev/null || true   # plaintext passwords — drop it
+}
+
+if ${BACKEND_MODE}; then
+    load_answers
+    loadkeys "${KEYMAP}" 2>/dev/null || true
+    log "BACKEND mode: disk=${DISK} lang=${LANG_CODE} kb=${KEYMAP} hostname=${HOSTNAME} tz=${TZ}"
+else
+
+# Step 0: always ask wizard language first (EN/FR)
+choose_ui_language
+
+if [[ "${AUTO_MODE}" == "false" ]]; then
+    welcome
+    choose_language
+    choose_keyboard
+    choose_hostname
+    choose_timezone
+    choose_network
+    choose_passwords
+    choose_disk
+
+    # Build a one-line network summary for the confirmation screen.
+    NET_SUMMARY="$(net_summary)"
+
+    # Final summary (bilingual)
+    whiptail \
+        --title "$(t 'Summary' 'Récapitulatif')" \
+        --yes-button "$(t 'Start Installation' 'Lancer linstallation')" \
+        --no-button "$(t 'Cancel' 'Annuler')" \
+        --yesno "$(t \
+            "VirtuaOS ${VERSION} will be installed with:\n\n  • Disk       : ${DISK}\n  • Hostname   : ${HOSTNAME}\n  • Language   : ${LANG_CODE}\n  • Keyboard   : ${KEYMAP}\n  • Timezone   : ${TZ}\n  • Network    : ${NET_SUMMARY}\n  • Shell user : virtua (password you set)\n  • Web admin  : admin (password you set)\n\nFINAL WARNING — all disk data will be lost." \
+            "VirtuaOS ${VERSION} va être installé avec :\n\n  • Disque     : ${DISK}\n  • Hostname   : ${HOSTNAME}\n  • Langue     : ${LANG_CODE}\n  • Clavier    : ${KEYMAP}\n  • Fuseau     : ${TZ}\n  • Réseau     : ${NET_SUMMARY}\n  • Shell user : virtua (mot de passe choisi)\n  • Web admin  : admin (mot de passe choisi)\n\nDERNIER AVERTISSEMENT — toutes les données du disque seront perdues.")" \
+        23 74 || exit 0
+else
+    # In AUTO mode we still need a non-default admin password to be safe.
+    choose_passwords
+    choose_disk  # auto-picks first internal disk + confirmation
+    log "AUTO mode: disk=${DISK} lang=${LANG_CODE} kb=${KEYMAP} hostname=${HOSTNAME} tz=${TZ}"
+fi
+
+fi   # end: interactive/auto vs backend answer collection
+
+# Suppress kernel messages during install
+echo 0 > /proc/sys/kernel/printk 2>/dev/null || true
+
+log "═══ VirtuaOS ${VERSION} installation started ═══"
+
+progress 1 "$(t 'Starting installation...' 'Démarrage de linstallation...')" ""
+partition_and_format
+copy_system
+configure_target
+install_grub
+
+INSTALL_OK=true
+if [[ ! -f "${TARGET}/boot/grub/grub.cfg" ]]; then
+    INSTALL_OK=false
+fi
+
+finalize
+
+progress 100 "$(t 'Installation complete!' 'Installation terminée !')" ""
+log "═══ Installation completed successfully ═══"
+
+# Restore printk
+echo 4 > /proc/sys/kernel/printk 2>/dev/null || true
+
+# Cleanup mounts (already done by finalize, but defensive)
+cleanup_mounts 2>/dev/null || true
+
+# Backend mode: the Rust front-end renders the success/failure screen and offers
+# the reboot. Just publish the terminal status and exit.
+if ${BACKEND_MODE}; then
+    if ${INSTALL_OK}; then
+        write_progress_status done ""
+        log "═══ Installation completed (backend) ═══"
+        exit 0
+    else
+        write_progress_status failed "GRUB config not generated — system may not boot"
+        exit 1
+    fi
+fi
+
+if ${INSTALL_OK}; then
+    whiptail \
+        --title "$(t 'VirtuaOS Installation Complete' 'VirtuaOS Installation terminée')" \
+        --yes-button "$(t 'Reboot now' 'Redémarrer maintenant')" \
+        --no-button "$(t 'Stay in live mode' 'Rester en live')" \
+        --yesno "$(t \
+            "VirtuaOS ${VERSION} is installed!\n\nAfter reboot, access the panel at:\n  http://<IP>:8441\n\n  Shell login  : virtua  (sudo enabled)\n  Root login   : root\n  Web panel    : admin\n  All three use the passwords you set during install.\n\nIMPORTANT: Remove the USB install media BEFORE rebooting.\n\nReboot now?" \
+            "VirtuaOS ${VERSION} est installé !\n\nAu redémarrage, accède au panel sur :\n  http://<IP>:8441\n\n  Connexion shell  : virtua  (sudo activé)\n  Connexion root   : root\n  Connexion panel  : admin\n  Tous utilisent les mots de passe choisis pendant l'install.\n\nIMPORTANT : Retire la clé USB AVANT de redémarrer.\n\nRedémarrer maintenant ?")" \
+        20 72 && reboot
+
+    # If user said "Stay in live mode", drop to shell
+    echo ""
+    echo "═══════════════════════════════════════════════════"
+    echo "  Installation done. You are still in live mode."
+    echo "  Reboot manually with: sudo reboot"
+    echo "═══════════════════════════════════════════════════"
+else
+    whiptail \
+        --title "$(t 'Installation incomplete' 'Installation incomplète')" \
+        --msgbox "$(t \
+            "Installation reached the end but GRUB config was not generated.\nThe installed system probably will NOT boot.\n\nCheck logs: ${LOG}\nThen drop to shell and inspect ${TARGET}" \
+            "L'installation est arrivée à la fin mais la config GRUB n'a pas été générée.\nLe système installé NE BOOTERA PROBABLEMENT PAS.\n\nVoir logs: ${LOG}\nPuis va au shell et inspecte ${TARGET}")" \
+        16 72
+    exit 1
+fi

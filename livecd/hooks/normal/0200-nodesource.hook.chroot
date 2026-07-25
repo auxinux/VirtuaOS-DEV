@@ -1,0 +1,29 @@
+#!/usr/bin/env bash
+# =============================================================================
+#  Hook 0200 — Install Node.js 22 (LTS) from NodeSource
+# =============================================================================
+set -euo pipefail
+
+NODE_MAJOR=22
+
+echo "[VirtuaOS] Installing Node.js ${NODE_MAJOR} from NodeSource…"
+
+# Ensure curl and ca-certificates are available
+apt-get install -y --no-install-recommends curl ca-certificates gnupg
+
+# Add NodeSource repo
+curl -fsSL "https://deb.nodesource.com/setup_${NODE_MAJOR}.x" | bash -
+
+# Install Node.js
+apt-get install -y nodejs
+
+# Pin npm to the 10.x line.
+# DO NOT upgrade to npm@latest (11.x): npm 11 gates dependency lifecycle/install
+# scripts behind an "allow-scripts" approval. Unapproved, the postinstall of
+# native packages is SKIPPED — esbuild never fetches its platform binary, so the
+# UI's `vite build` fails in the chroot (and better-sqlite3/argon2/node-pty would
+# fail at runtime). npm 10.x (also what Node 22 LTS bundles) runs these scripts.
+npm install -g npm@10 --quiet 2>/dev/null || true
+
+echo "[VirtuaOS] Node.js $(node --version) installed."
+echo "[VirtuaOS] npm $(npm --version) installed."

@@ -1,0 +1,150 @@
+# =============================================================================
+#  VirtuaOS — Base system + installer dependencies (Debian 13 Trixie)
+# =============================================================================
+
+# Kernel & boot
+# NOTE: the kernel is NOT listed here. VirtuaOS ships the AuxiNux hypervisor
+# kernel "kernel-virtua" (7.x-auxinux-virtua), installed by live-build's kernel
+# stage via --linux-packages "kernel" --linux-flavours "virtua" (see config.sh).
+# Do NOT add linux-image-amd64 back: having both kernels in /boot would make
+# the live ISO embed an ambiguous kernel and defeat the custom-kernel build.
+firmware-linux-free
+live-boot
+live-config
+live-config-systemd
+
+# Bootloaders (needed at install time on target disk)
+grub-pc-bin
+grub-efi-amd64-bin
+grub-efi-amd64
+grub-common
+grub2-common
+shim-signed
+efibootmgr
+mokutil
+os-prober
+
+# Disk & filesystem tools (installer needs these)
+parted
+gdisk
+fdisk
+dosfstools
+e2fsprogs
+xfsprogs
+btrfs-progs
+mtools
+gparted
+
+# Installer UI
+whiptail
+dialog
+console-data
+console-setup
+keyboard-configuration
+
+# Essential system tools
+bash
+coreutils
+util-linux
+procps
+systemd
+systemd-sysv
+systemd-timesyncd
+kmod
+dbus
+dbus-user-session
+polkitd
+pkexec
+
+# Package management
+apt
+ca-certificates
+gnupg
+lsb-release
+
+# Network tools
+iproute2
+iputils-ping
+iputils-arping
+net-tools
+curl
+wget
+dnsutils
+traceroute
+ncat
+socat
+nfs-common
+cifs-utils
+network-manager
+
+# WiFi (server may be on wireless — installer/CLI support WiFi via NetworkManager)
+wpasupplicant
+iw
+wireless-tools
+rfkill
+# Non-free WiFi/NIC firmware (requires the non-free-firmware apt component, which
+# the AuxiNux Debian mirror ships). Without these, common WiFi chips have no driver.
+firmware-iwlwifi
+firmware-realtek
+firmware-atheros
+firmware-brcm80211
+firmware-misc-nonfree
+
+# Archive tools
+tar
+gzip
+xz-utils
+unzip
+zip
+rsync
+mdadm
+lvm2
+
+# Build tools (for npm native modules + Virtua build during chroot)
+build-essential
+python3
+python3-pip
+make
+g++
+pkg-config
+git
+
+# Security
+sudo
+acl
+openssl
+apparmor
+apparmor-utils
+
+# System utilities
+lsof
+htop
+iotop
+nmap
+strace
+file
+pciutils
+usbutils
+dmidecode
+psmisc
+jq
+vim
+nano
+less
+man-db
+
+# Locales (multi-language support)
+locales
+locales-all
+
+# Bridging & virt networking
+bridge-utils
+iptables
+nftables
+dnsmasq-base
+ebtables
+isc-dhcp-client
+ifupdown
+
+# Console / SSH
+openssh-server

@@ -1,0 +1,98 @@
+#!/usr/bin/env bash
+# =============================================================================
+#  Hook 0150 — Create 'virtua' shell user + autologin in live mode
+# =============================================================================
+set -euo pipefail
+
+USER_NAME="virtua"
+USER_PASS="admin123"
+
+echo "[VirtuaOS] Creating shell user '${USER_NAME}'…"
+
+# Create user if not exists (live-config might create it too — handle both)
+if ! id "${USER_NAME}" >/dev/null 2>&1; then
+    useradd -m -s /bin/bash -G sudo,audio,video,plugdev,netdev "${USER_NAME}"
+fi
+
+# Set password
+echo "${USER_NAME}:${USER_PASS}" | chpasswd
+
+# Add to virtualization groups (created when libvirt/lxc/docker installed)
+for grp in libvirt libvirt-qemu kvm docker lxd; do
+    getent group "$grp" >/dev/null 2>&1 && \
+        usermod -aG "$grp" "${USER_NAME}" 2>/dev/null || true
+done
+
+# Sudoers: virtua can sudo without password (convenient for installer + admin)
+cat > /etc/sudoers.d/90-virtuaos-virtua <<EOF
+${USER_NAME} ALL=(ALL) NOPASSWD: ALL
+Defaults:${USER_NAME} !authenticate
+EOF
+chmod 0440 /etc/sudoers.d/90-virtuaos-virtua
+
+# ── Autologin on tty1 (live mode) ─────────────────────────────────────────────
+mkdir -p /etc/systemd/system/getty@tty1.service.d
+cat > /etc/systemd/system/getty@tty1.service.d/autologin.conf <<EOF
+[Service]
+ExecStart=
+ExecStart=-/sbin/agetty --autologin ${USER_NAME} --noclear %I \$TERM
+Type=idle
+EOF
+
+# ── .bash_profile : detect installer mode from kernel cmdline ─────────────────
+mkdir -p /home/${USER_NAME}
+cat > /home/${USER_NAME}/.bash_profile <<'EOF'
+# VirtuaOS — auto-launch installer if kernel cmdline says so
+
+[[ -f ~/.bashrc ]] && source ~/.bashrc
+
+# Only on tty1 (live console)
+if [[ "$(tty)" == "/dev/tty1" ]]; then
+    # Silence kernel messages immediately so they don't bleed into the wizard
+    sudo bash -c 'echo 0 > /proc/sys/kernel/printk' 2>/dev/null || true
+    dmesg -n 1 2>/dev/null || true
+
+    # Anti-loop: only auto-launch installer ONCE per boot
+    # If it has run, drop to shell so the user can read errors / retry manually
+    INSTALLER_FLAG="/tmp/.virtuaos-installer-ran"
+
+    if [[ -f "${INSTALLER_FLAG}" ]]; then
+        echo ""
+        echo "═══════════════════════════════════════════════════════════"
+        echo "  VirtuaOS Installer has already run on this boot."
+        echo ""
+        echo "  • Logs    : sudo cat /var/log/virtuaos-install.log"
+        echo "  • Retry   : sudo /usr/local/sbin/virtuaos-install"
+        echo "  • Reboot  : sudo reboot"
+        echo "  • Shell   : you are here  (user: virtua, sudo OK)"
+        echo "═══════════════════════════════════════════════════════════"
+        echo ""
+        # Drop to shell — do NOT re-launch
+    elif grep -q "vos_mode=install-auto" /proc/cmdline 2>/dev/null; then
+        touch "${INSTALLER_FLAG}"
+        clear && reset
+        sudo /usr/local/sbin/virtuaos-install --auto || true
+        echo ""
+        echo "Installer exited. Type 'sudo cat /var/log/virtuaos-install.log' to see what happened."
+    elif grep -q "vos_mode=install" /proc/cmdline 2>/dev/null; then
+        touch "${INSTALLER_FLAG}"
+        clear && reset
+        # Prefer the Rust TUI front-end (virtuaos-installer); fall back to the
+        # bash wizard if it's absent, fails to start, or vos_ui=text is set.
+        if [[ -x /usr/local/sbin/virtuaos-installer ]] && \
+           ! grep -q "vos_ui=text" /proc/cmdline 2>/dev/null; then
+            sudo /usr/local/sbin/virtuaos-installer \
+                || sudo /usr/local/sbin/virtuaos-install \
+                || true
+        else
+            sudo /usr/local/sbin/virtuaos-install || true
+        fi
+        echo ""
+        echo "Installer exited. Type 'sudo cat /var/log/virtuaos-install.log' to see what happened."
+    fi
+fi
+EOF
+chown -R "${USER_NAME}:${USER_NAME}" /home/${USER_NAME}
+chmod 0644 /home/${USER_NAME}/.bash_profile
+
+echo "[VirtuaOS] User '${USER_NAME}' ready (password: ${USER_PASS}, autologin enabled)"

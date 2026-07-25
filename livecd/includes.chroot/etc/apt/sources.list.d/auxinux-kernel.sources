@@ -1,0 +1,12 @@
+## AuxiNux Virtua kernel repository — persists on the INSTALLED system so the
+## hypervisor kernel (kernel-virtua / 7.x-auxinux-virtua) can be upgraded with
+## `apt update && apt full-upgrade`.
+## The keyring below is installed at build time by build.sh (fetched from
+## https://dep.auxinux.ca/VIRTUA/virtua-archive-keyring.asc). apt accepts an
+## ASCII-armored keyring directly in Signed-By, so no dearmoring is required.
+Types: deb
+URIs: https://dep.auxinux.ca/VIRTUA
+Suites: kernel
+Components: main
+Architectures: amd64
+Signed-By: /usr/share/keyrings/virtua-archive-keyring.asc

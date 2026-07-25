@@ -1,0 +1,26 @@
+[package]
+name = "virtuaos-cli"
+version = "0.1.9"
+edition = "2021"
+description = "VirtuaOS — host & update manager"
+license = "proprietary"
+authors = ["AuxiNux"]
+
+# The shipped command is `virtuaos`; the crate is `virtuaos-cli` (matches the
+# Debian package name served from dep.auxinux.ca/VIRTUA suite `virtua`).
+[[bin]]
+name = "virtuaos"
+path = "src/main.rs"
+
+[dependencies]
+clap = { version = "4", features = ["derive"] }
+anyhow = "1"
+owo-colors = "4"
+libc = "0.2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[profile.release]
+strip = true
+lto = true
+opt-level = "z"

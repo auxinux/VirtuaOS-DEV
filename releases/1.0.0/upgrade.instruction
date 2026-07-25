@@ -1,0 +1,19 @@
+{
+  "version": "1.0.0",
+  "messages": [
+    "Initialisation du canal de mise à niveau VirtuaOS 1.0.0.",
+    "Cette version pose le marqueur officiel 1.0.0 sans réinstaller l’hôte."
+  ],
+  "aptInstall": [
+    "kernel-virtua",
+    "auxinux-virtua",
+    "virtuaos-cli"
+  ],
+  "commands": [
+    {
+      "description": "Écrire le marqueur de version VirtuaOS",
+      "run": "printf '%s\\n' '1.0.0' > /etc/virtuaos-version"
+    }
+  ],
+  "rebootRequired": false
+}

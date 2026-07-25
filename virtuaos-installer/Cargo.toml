@@ -1,0 +1,33 @@
+[package]
+name = "virtuaos-installer"
+version = "1.0.0"
+edition = "2021"
+# Debian 13 (trixie) ships rustc/cargo 1.85. Pin the MSRV so the MSRV-aware
+# resolver picks dependency versions that build with 1.85 — otherwise newer
+# transitive deps (instability/darling want 1.88) break the native build on the
+# build VM and force a Docker fallback.
+rust-version = "1.85"
+description = "VirtuaOS graphical (TUI) installer front-end — collects answers in a ratatui wizard, then drives the proven virtuaos-install backend and renders live progress."
+license = "Proprietary"
+
+# Single-package workspace so we can opt into the MSRV-aware dependency resolver
+# (stabilised in Rust 1.84). With this, `rust-version` above actually constrains
+# transitive version selection.
+[workspace]
+resolver = "3"
+
+[[bin]]
+name = "virtuaos-installer"
+path = "src/main.rs"
+
+[dependencies]
+ratatui = "0.29"
+crossterm = "0.28"
+anyhow = "1"
+libc = "0.2"
+
+[profile.release]
+strip = true
+lto = true
+opt-level = "s"
+panic = "abort"

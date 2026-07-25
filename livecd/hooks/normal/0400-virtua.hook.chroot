@@ -1,0 +1,304 @@
+#!/usr/bin/env bash
+# =============================================================================
+#  Hook 0400 — Pre-build Virtua + install systemd units (OFFLINE READY)
+#  Source bundled at /opt/auxinux-virtua via includes.chroot
+# =============================================================================
+set -euo pipefail
+
+VIRTUA_DIR="/opt/auxinux-virtua"
+SERVICE_USER="auxinuxvirtual"
+DATA_DIR="/var/lib/auxinuxvirtual"
+RUNNER_SOCK="/run/auxinuxvirtual.sock"
+VIRTUA_PORT="8441"
+
+echo "[VirtuaOS] ═══ Pre-building Virtua panel ═══"
+
+[[ -d "${VIRTUA_DIR}" ]] || {
+    echo "[VirtuaOS][FATAL] Virtua source not found at ${VIRTUA_DIR}"
+    exit 1
+}
+
+# ── 1. System service user (for runner) ──────────────────────────────────────
+if ! id "${SERVICE_USER}" >/dev/null 2>&1; then
+    useradd --system --no-create-home --shell /usr/sbin/nologin "${SERVICE_USER}"
+fi
+for grp in libvirt libvirt-qemu kvm docker; do
+    getent group "$grp" >/dev/null 2>&1 && \
+        usermod -aG "$grp" "${SERVICE_USER}" 2>/dev/null || true
+done
+
+# ── 2. Build the monorepo (npm install + tsc compile) ────────────────────────
+cd "${VIRTUA_DIR}"
+
+# Build a workspace, streaming FULL output. Abort the hook loudly on failure —
+# do NOT truncate with `tail` (it hides the real tsc/vite/rollup error) and do
+# NOT swallow with `|| true` (a failed @auxinux/shared cascades into api/ui).
+build_step() {
+    local label="$1" dir="$2"; shift 2
+    echo "[VirtuaOS] ${label}…  (cwd=${dir})"
+    if ! ( cd "${dir}" && "$@" ); then
+        echo "[VirtuaOS][FATAL] ${label} failed in ${dir}"
+        echo "[VirtuaOS][FATAL] command: $*"
+        exit 1
+    fi
+}
+
+echo "[VirtuaOS] Installing monorepo dependencies…"
+# Root install hoists ALL workspace deps (incl. platform-native binaries for
+# this chroot's arch, e.g. esbuild/rollup linux-x64). Full output, fatal on fail.
+npm install --prefer-offline --no-audit --no-fund \
+    || npm install --no-audit --no-fund \
+    || { echo "[VirtuaOS][FATAL] npm install (monorepo) failed"; exit 1; }
+
+build_step "Building @auxinux/shared" packages/shared npx tsc -p tsconfig.json
+build_step "Building runner"          apps/runner     npx tsc -p tsconfig.json
+build_step "Building API"             apps/api        npx tsc -p tsconfig.json
+build_step "Building UI (Vite)"       apps/ui         npm run build
+build_step "Building CLI (virtua)"    apps/cli        npx tsc -p tsconfig.json
+
+# ── 2b. Install the `virtua` CLI command on PATH ─────────────────────────────
+# apps/cli (@auxinux/cli) declares bin "virtua" -> dist/cli.js. The chroot has no
+# global npm link, so expose it ourselves via a small wrapper on PATH. This is
+# what makes `virtua <subcommand>` work on the installed system.
+if [[ -f "${VIRTUA_DIR}/apps/cli/dist/cli.js" ]]; then
+    cat > /usr/local/bin/virtua <<EOF
+#!/bin/sh
+exec /usr/bin/node "${VIRTUA_DIR}/apps/cli/dist/cli.js" "\$@"
+EOF
+    chmod 0755 /usr/local/bin/virtua
+    echo "[VirtuaOS] virtua CLI installed → /usr/local/bin/virtua"
+else
+    echo "[VirtuaOS][FATAL] CLI build produced no dist/cli.js"
+    exit 1
+fi
+
+# ── 3. Create data dirs ───────────────────────────────────────────────────────
+DATA_DIRS=(
+    "${DATA_DIR}"
+    "${DATA_DIR}/db"
+    "${DATA_DIR}/ssl"
+    "${DATA_DIR}/backups"
+    "${DATA_DIR}/templates/lxc"
+    "${DATA_DIR}/templates/docker"
+    "/var/lib/libvirt/images"
+    "/var/lib/libvirt/images/isos"
+    "/var/lib/lxc"
+)
+for d in "${DATA_DIRS[@]}"; do
+    install -d -m 0750 -o "${SERVICE_USER}" -g "${SERVICE_USER}" "$d" 2>/dev/null || \
+        install -d -m 0750 "$d"
+done
+
+# ── 4. Write systemd service units ────────────────────────────────────────────
+cat > /etc/systemd/system/auxinuxvirtual-runner.service <<EOF
+[Unit]
+Description=AuxiNux Virtua Runner
+After=network-online.target docker.service libvirtd.service virtqemud.service
+Wants=network-online.target docker.service
+
+[Service]
+Type=simple
+User=root
+Group=root
+WorkingDirectory=${VIRTUA_DIR}/apps/runner
+ExecStart=/usr/bin/node ${VIRTUA_DIR}/apps/runner/dist/runner.js
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=30
+Environment=AUXINUX_RUNNER_SOCK=${RUNNER_SOCK}
+RuntimeDirectory=auxinuxvirtual
+RuntimeDirectoryMode=0750
+LimitNOFILE=65536
+LimitNPROC=8192
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+cat > /etc/systemd/system/auxinuxvirtual-api.service <<EOF
+[Unit]
+Description=AuxiNux Virtua API
+After=network-online.target auxinuxvirtual-runner.service
+Wants=network-online.target
+Requires=auxinuxvirtual-runner.service
+
+[Service]
+Type=simple
+User=root
+Group=root
+WorkingDirectory=${VIRTUA_DIR}/apps/api
+EnvironmentFile=${VIRTUA_DIR}/apps/api/.env
+ExecStart=/usr/bin/node ${VIRTUA_DIR}/apps/api/dist/server.js
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=30
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=auxinuxvirtual-api
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+# ── 5. Generate INITIAL .env (dummy session secret — real one set on first boot) ─
+# IMPORTANT: variable names MUST be prefixed AUXINUX_ — the API reads
+# AUXINUX_PORT / AUXINUX_DATA_DIR / AUXINUX_RUNNER_SOCK / AUXINUX_SESSION_SECRET.
+# Using bare PORT=/DATA_DIR= silently falls back to dev defaults (port 3001,
+# /var/lib/auxinux) and the panel becomes unreachable on the expected port.
+mkdir -p "${VIRTUA_DIR}/apps/api"
+cat > "${VIRTUA_DIR}/apps/api/.env" <<EOF
+AUXINUX_PORT=${VIRTUA_PORT}
+NODE_ENV=production
+AUXINUX_DATA_DIR=${DATA_DIR}
+AUXINUX_RUNNER_SOCK=${RUNNER_SOCK}
+AUXINUX_SESSION_SECRET=__REGENERATE_ON_FIRST_BOOT__
+QEMU_ISOS_DIR=/var/lib/libvirt/images/isos
+LXC_TEMPLATES_DIR=${DATA_DIR}/templates/lxc
+DOCKER_ARCHIVES_DIR=${DATA_DIR}/templates/docker
+VM_DISKS_DIR=/var/lib/libvirt/images
+EOF
+chmod 0600 "${VIRTUA_DIR}/apps/api/.env"
+
+# ── 6. Enable services (will start on installed system) ──────────────────────
+# `systemctl enable` inside live-build chroot is unreliable (systemd not pid 1)
+# and we previously masked the error with `|| true`, leaving services NOT
+# enabled on the installed system. We now create the WantedBy symlinks by hand
+# so enabling is deterministic regardless of the chroot's systemd state.
+enable_unit() {
+    local unit="$1" target="${2:-multi-user.target}"
+    local link_dir="/etc/systemd/system/${target}.wants"
+    local unit_path="/etc/systemd/system/${unit}"
+    [[ -f "${unit_path}" ]] || unit_path="/lib/systemd/system/${unit}"
+    [[ -f "${unit_path}" ]] || { echo "[VirtuaOS][WARN] enable_unit: unit not found: ${unit}"; return 0; }
+    mkdir -p "${link_dir}"
+    ln -sf "${unit_path}" "${link_dir}/${unit}"
+}
+
+enable_unit auxinuxvirtual-runner.service
+enable_unit auxinuxvirtual-api.service
+# Docker: NOT enabled in the live image — it fails on live (overlay/upperdir)
+# The installer re-enables it in the installed system via configure_target()
+# Libvirt on Debian 13: split daemons. virtqemud handles QEMU directly;
+# the monolithic libvirtd is a compat wrapper that is inactive by default.
+# We enable both so the panel works on installs that prefer either setup.
+enable_unit libvirtd.service
+enable_unit virtqemud.service
+enable_unit virtnetworkd.service
+enable_unit virtstoraged.service
+enable_unit lxc-net.service
+enable_unit ssh.service
+
+# Socket activation for virtqemud (used by virsh on Debian 13 modular setup).
+mkdir -p /etc/systemd/system/sockets.target.wants
+for sock in virtqemud.socket virtqemud-ro.socket virtqemud-admin.socket \
+            virtnetworkd.socket virtstoraged.socket; do
+    if [[ -f "/lib/systemd/system/${sock}" ]]; then
+        ln -sf "/lib/systemd/system/${sock}" "/etc/systemd/system/sockets.target.wants/${sock}"
+    fi
+done
+
+# ── 6b. Create a live-mode Docker suppressor (avoids FAILED spam on tty) ──────
+# When booting live, we mask Docker so it silently stays off
+mkdir -p /etc/systemd/system
+ln -sf /dev/null /etc/systemd/system/docker.service.live-mask 2>/dev/null || true
+cat > /etc/systemd/system/docker-live-disable.service <<'EOF'
+[Unit]
+Description=Disable Docker in live mode
+ConditionKernelCommandLine=boot=live
+DefaultDependencies=no
+Before=docker.service
+
+[Service]
+Type=oneshot
+ExecStart=/bin/systemctl mask --now docker.service containerd.service
+RemainAfterExit=yes
+
+[Install]
+WantedBy=sysinit.target
+EOF
+systemctl enable docker-live-disable.service 2>/dev/null || true
+
+# ── 7. First-boot regeneration service (unique session secret + SSH keys) ────
+cat > /etc/systemd/system/virtuaos-firstboot.service <<EOF
+[Unit]
+Description=VirtuaOS First-Boot Regeneration (unique secrets)
+ConditionPathExists=!/etc/virtuaos/.firstboot-done
+Before=auxinuxvirtual-api.service ssh.service
+After=local-fs.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/sbin/virtuaos-firstboot
+StandardOutput=journal
+
+[Install]
+WantedBy=multi-user.target
+EOF
+enable_unit virtuaos-firstboot.service
+
+# ── 8. Kernel modules + sysctl ───────────────────────────────────────────────
+cat > /etc/modules-load.d/virtuaos.conf <<'EOF'
+kvm
+vhost_net
+vhost_vsock
+vhost_scsi
+br_netfilter
+tun
+macvtap
+virtio
+virtio_pci
+virtio_net
+virtio_blk
+virtio_scsi
+virtio_balloon
+virtio_console
+virtio_rng
+virtio_input
+virtio_gpu
+vfio
+vfio_iommu_type1
+vfio_pci
+EOF
+
+cat > /etc/sysctl.d/99-virtuaos.conf <<'EOF'
+net.ipv4.ip_forward = 1
+net.ipv6.conf.all.forwarding = 1
+net.bridge.bridge-nf-call-iptables = 1
+net.bridge.bridge-nf-call-ip6tables = 1
+EOF
+
+# ── 9. Docker daemon config ──────────────────────────────────────────────────
+mkdir -p /etc/docker
+cat > /etc/docker/daemon.json <<'EOF'
+{
+  "log-driver": "json-file",
+  "log-opts": { "max-size": "10m", "max-file": "5" },
+  "exec-opts": ["native.cgroupdriver=systemd"],
+  "storage-driver": "overlay2",
+  "iptables": true,
+  "ip-forward": true,
+  "ip-masq": true,
+  "live-restore": true,
+  "dns": ["1.1.1.1", "8.8.8.8"],
+  "features": { "buildkit": true }
+}
+EOF
+
+# ── 10. LXC default bridge config ────────────────────────────────────────────
+cat > /etc/default/lxc-net <<'EOF'
+USE_LXC_BRIDGE="true"
+LXC_BRIDGE="lxcbr0"
+LXC_ADDR="10.0.3.1"
+LXC_NETMASK="255.255.255.0"
+LXC_NETWORK="10.0.3.0/24"
+LXC_DHCP_RANGE="10.0.3.100,10.0.3.200"
+LXC_DHCP_MAX="101"
+EOF
+
+# ── 11. Final ownership ──────────────────────────────────────────────────────
+chown -R "${SERVICE_USER}:${SERVICE_USER}" "${VIRTUA_DIR}" 2>/dev/null || true
+chmod 750 "${VIRTUA_DIR}"
+
+echo "[VirtuaOS] ═══ Virtua pre-build complete ═══"

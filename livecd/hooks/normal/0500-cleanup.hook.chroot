@@ -1,0 +1,29 @@
+#!/usr/bin/env bash
+# =============================================================================
+#  Hook 0500 — Cleanup: remove build debris, trim ISO size
+# =============================================================================
+set -euo pipefail
+
+echo "[VirtuaOS] Cleaning up build artifacts…"
+
+# Remove npm caches (saves ~200-400 MB)
+rm -rf /root/.npm /home/*/.npm /tmp/npm-* 2>/dev/null || true
+npm cache clean --force 2>/dev/null || true
+
+# Remove pip caches
+rm -rf /root/.cache /home/*/.cache 2>/dev/null || true
+
+# Remove apt lists (will be refreshed on first boot)
+rm -rf /var/lib/apt/lists/* /var/cache/apt/archives/*.deb 2>/dev/null || true
+
+# Remove Python .pyc caches
+find /usr/lib/python3 -name "__pycache__" -exec rm -rf {} + 2>/dev/null || true
+find /usr/lib/python3 -name "*.pyc" -delete 2>/dev/null || true
+
+# Remove man pages not needed in a server ISO
+rm -rf /usr/share/doc/* /usr/share/man/man[2-9] 2>/dev/null || true
+
+# Remove build tools if not needed at runtime
+# (keep build-essential for npm native modules at runtime)
+
+echo "[VirtuaOS] Cleanup done."

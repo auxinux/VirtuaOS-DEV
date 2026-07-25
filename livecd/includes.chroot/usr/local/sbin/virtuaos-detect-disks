@@ -1,0 +1,67 @@
+#!/usr/bin/env bash
+# =============================================================================
+#  VirtuaOS — Detect INTERNAL disks (filter out USB / live boot media)
+#
+#  Output format (one disk per line, tab-separated):
+#    /dev/sda	500G	SAMSUNG MZ7LH512	internal
+#
+#  Filtering rules:
+#    1. Must be a real disk (TYPE=disk, not loop, ram, rom)
+#    2. Must NOT be removable (RM=0)
+#    3. Must NOT use USB transport
+#    4. Must NOT contain the live boot mountpoint (/cdrom or /run/live/medium)
+#    5. Must be at least 8 GiB
+# =============================================================================
+set -euo pipefail
+
+MIN_SIZE_BYTES=$(( 8 * 1024 * 1024 * 1024 ))  # 8 GiB
+
+# Identify the disk hosting the live medium (so we exclude it)
+LIVE_DEV=""
+for mp in /run/live/medium /cdrom /run/live/findiso /lib/live/mount/medium; do
+    if mountpoint -q "$mp" 2>/dev/null; then
+        SRC="$(findmnt -n -o SOURCE "$mp" 2>/dev/null | head -1 || true)"
+        if [[ -n "$SRC" ]]; then
+            # Walk up to the parent disk (e.g. /dev/sdb1 → /dev/sdb)
+            LIVE_DEV="$(lsblk -n -o PKNAME "$SRC" 2>/dev/null | head -1 || true)"
+            [[ -n "$LIVE_DEV" ]] && LIVE_DEV="/dev/${LIVE_DEV}"
+            break
+        fi
+    fi
+done
+
+# Iterate all block devices that look like real disks
+while IFS= read -r line; do
+    NAME="$(echo "$line" | awk '{print $1}')"
+    SIZE_BYTES="$(echo "$line" | awk '{print $2}')"
+    TYPE="$(echo "$line" | awk '{print $3}')"
+    RM="$(echo "$line" | awk '{print $4}')"
+    TRAN="$(echo "$line" | awk '{print $5}')"
+
+    DEV="/dev/${NAME}"
+
+    # Filter: only real disks
+    [[ "${TYPE}" == "disk" ]] || continue
+
+    # Filter: skip removable
+    [[ "${RM}" == "0" ]] || continue
+
+    # Filter: skip USB transport
+    [[ "${TRAN}" != "usb" ]] || continue
+
+    # Filter: skip the live boot device
+    [[ "${DEV}" != "${LIVE_DEV}" ]] || continue
+
+    # Filter: skip too small
+    [[ "${SIZE_BYTES}" -ge "${MIN_SIZE_BYTES}" ]] || continue
+
+    # Format size human-readable
+    SIZE_HR="$(numfmt --to=iec --suffix=B --padding=7 "${SIZE_BYTES}" 2>/dev/null | tr -d ' ' || echo "${SIZE_BYTES}B")"
+
+    # Get model name
+    MODEL="$(lsblk -d -n -o MODEL "${DEV}" 2>/dev/null | sed 's/^ *//;s/ *$//' || echo "Unknown")"
+    [[ -z "${MODEL}" ]] && MODEL="Unknown"
+
+    printf "%s\t%s\t%s\tinternal\n" "${DEV}" "${SIZE_HR}" "${MODEL}"
+
+done < <(lsblk -d -b -n -o NAME,SIZE,TYPE,RM,TRAN 2>/dev/null)

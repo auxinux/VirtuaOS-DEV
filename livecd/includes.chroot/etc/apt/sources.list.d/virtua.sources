@@ -1,0 +1,13 @@
+## AuxiNux Virtua application repository — persists on the INSTALLED system so the
+## Virtua panel (auxinux-virtua) and the updater (virtuaos-cli) can be upgraded
+## with `virtuaos update` / `apt`. Same host and signing key as the kernel suite,
+## different Suite (`virtua` vs `kernel`). The keyring is the one provisioned at
+## build time by build.sh from dep.auxinux.ca/VIRTUA/virtua-archive-keyring.asc —
+## a single key file signs both suites, so we reference it here too (rather than
+## inlining the key) to keep one source of truth.
+Types: deb
+URIs: https://dep.auxinux.ca/VIRTUA
+Suites: virtua
+Components: main
+Architectures: amd64
+Signed-By: /usr/share/keyrings/virtua-archive-keyring.asc

@@ -1,0 +1,58 @@
+#!/usr/bin/env bash
+# =============================================================================
+#  Hook 0300 — Install Docker CE from Docker's official repository
+# =============================================================================
+set -euo pipefail
+
+DOCKER_KEYRING="/etc/apt/keyrings/docker.gpg"
+DOCKER_LIST="/etc/apt/sources.list.d/docker.list"
+
+echo "[VirtuaOS] Installing Docker CE…"
+
+install -m 0755 -d /etc/apt/keyrings
+
+# Add Docker GPG key
+curl -fsSL https://download.docker.com/linux/debian/gpg | \
+    gpg --dearmor -o "${DOCKER_KEYRING}"
+chmod a+r "${DOCKER_KEYRING}"
+
+# Add Docker apt repo (Debian 13 = trixie)
+cat > "${DOCKER_LIST}" <<EOF
+deb [arch=amd64 signed-by=${DOCKER_KEYRING}] https://download.docker.com/linux/debian trixie stable
+EOF
+
+apt-get update -qq
+
+# Install Docker
+if ! apt-get install -y docker-ce docker-ce-cli containerd.io \
+        docker-buildx-plugin docker-compose-plugin 2>/dev/null; then
+    echo "[VirtuaOS] Docker CE unavailable on mirror, falling back to docker.io…"
+    apt-get install -y docker.io docker-compose 2>/dev/null || \
+        echo "[VirtuaOS][WARN] Docker installation failed — will retry on first boot."
+fi
+
+# Configure Docker daemon
+install -d -m 0755 /etc/docker
+cat > /etc/docker/daemon.json <<'EOF'
+{
+  "log-driver": "json-file",
+  "log-opts": {
+    "max-size": "10m",
+    "max-file": "5"
+  },
+  "exec-opts": ["native.cgroupdriver=systemd"],
+  "storage-driver": "overlay2",
+  "iptables": true,
+  "ip-forward": true,
+  "ip-masq": true,
+  "live-restore": true,
+  "features": {
+    "buildkit": true
+  }
+}
+EOF
+
+# Enable Docker service
+systemctl enable docker.service containerd.service 2>/dev/null || true
+
+echo "[VirtuaOS] Docker $(docker --version 2>/dev/null || echo 'installed') ready."

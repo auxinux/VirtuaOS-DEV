@@ -1,0 +1,65 @@
+#!/bin/sh
+# =============================================================================
+#  Hook 0480 (chroot) — Guarantee an initrd for the AuxiNux kernel
+#
+#  live-build installs the AuxiNux kernel (kernel-virtua / 7.x-auxinux-virtua)
+#  during its chroot_linux-image step, which runs BEFORE the package lists pull
+#  in live-boot / initramfs-tools. Custom `make bindeb-pkg` kernels also usually
+#  do NOT declare `Depends: initramfs-tools`. The net effect: no initramfs
+#  generator is present at kernel-install time, so /boot/initrd.img-<ver> is
+#  never created. binary_linux-image then copies vmlinuz-<ver> with no matching
+#  initrd, the live system has nothing to boot, and hook 9100 aborts.
+#
+#  This hook runs LATE in the chroot stage (after the package lists, so live-boot
+#  and initramfs-tools exist) and (re)builds the initrd for every installed
+#  kernel. Rebuilding also bakes live-boot INTO the initrd — mandatory for the
+#  live medium to mount its squashfs and boot at all.
+# =============================================================================
+set -e
+
+echo "[VirtuaOS] Ensuring initramfs for the AuxiNux kernel…"
+
+# Make sure an initramfs generator is available (live-boot normally depends on
+# initramfs-tools, but be defensive in case it was satisfied by an alternative).
+if ! command -v update-initramfs >/dev/null 2>&1; then
+    echo "[VirtuaOS]   update-initramfs missing — installing initramfs-tools"
+    apt-get update
+    apt-get install -y --no-install-recommends initramfs-tools
+fi
+
+built=0
+for moddir in /lib/modules/*; do
+    [ -d "${moddir}" ] || continue
+    kver="${moddir#/lib/modules/}"
+    # Only handle kernels that actually shipped a vmlinuz in /boot.
+    [ -e "/boot/vmlinuz-${kver}" ] || continue
+
+    if [ -e "/boot/initrd.img-${kver}" ]; then
+        echo "[VirtuaOS]   refreshing initrd for ${kver} (ensure live-boot is included)"
+        update-initramfs -u -k "${kver}"
+    else
+        echo "[VirtuaOS]   creating initrd for ${kver}"
+        update-initramfs -c -k "${kver}"
+    fi
+    built=1
+done
+
+if [ "${built}" -ne 1 ]; then
+    echo "[VirtuaOS][FATAL] No kernel found under /lib/modules with a matching /boot/vmlinuz-* — cannot build an initrd." >&2
+    ls -la /boot >&2 || true
+    exit 1
+fi
+
+# Hard guarantee: the AuxiNux kernel must end up with an initrd.
+for vm in /boot/vmlinuz-*auxinux-virtua*; do
+    [ -e "${vm}" ] || continue
+    ver="${vm#/boot/vmlinuz-}"
+    if [ ! -e "/boot/initrd.img-${ver}" ]; then
+        echo "[VirtuaOS][FATAL] No initrd produced for AuxiNux kernel ${ver}." >&2
+        ls -la /boot >&2 || true
+        exit 1
+    fi
+    echo "[VirtuaOS] initrd ready: /boot/initrd.img-${ver}"
+done
+
+echo "[VirtuaOS] initramfs check complete."
