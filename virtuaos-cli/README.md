@@ -33,11 +33,25 @@ vos vdm update
 vos vdm movenode <target-node>
 vos vdm uninstall
 vos vdm ha enable|disable|status
+vos docker ps
+vos docker logs <id> [--tail N]
+vos docker stats <id>
+vos docker exec <id> <command...>
+vos docker start|stop|restart <id>
+vos docker prune [all|containers|images|volumes|networks]
+vos services
+vos services restart [unit]
+vos services status <unit>
 ```
 
 `virtuaos` and `vos` are identical. VDM installation performs cluster-wide
 discovery and locking: it refuses while another node reports an existing VDM,
 a VDM registration, an installation lock, or cannot be verified.
+
+`vos docker` talks directly to the local runner socket
+(`/run/auxinuxvirtual.sock`), so it works on the host without the Node CLI and
+without an API session. `vos services` lists and restarts the Virtua stack
+systemd units.
 
 `virtuaos version` now prints the VirtuaOS release marker from
 `/etc/virtuaos-version` when present, so `vos os upgrade` becomes visible in the

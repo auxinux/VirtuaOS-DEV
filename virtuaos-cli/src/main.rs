@@ -7,8 +7,10 @@
 //! comes in a later phase.
 
 mod branding;
+mod docker;
 mod network;
 mod os;
+mod services;
 mod setup;
 mod system;
 mod update;
@@ -64,6 +66,16 @@ enum Command {
     Vdm {
         #[command(subcommand)]
         cmd: Option<VdmCmd>,
+    },
+    /// Manage Docker containers on this host via the local runner.
+    Docker {
+        #[command(subcommand)]
+        cmd: Option<DockerCmd>,
+    },
+    /// Manage the Virtua stack systemd services.
+    Services {
+        #[command(subcommand)]
+        cmd: Option<ServicesCmd>,
     },
     /// (internal) Stamp this cli's VirtuaOS release onto /etc/os-release + issue.
     /// Run by the virtuaos-cli package postinst so `virtuaos update` promotes the
@@ -163,6 +175,70 @@ enum VdmHaCmd {
     Status,
 }
 
+#[derive(Subcommand)]
+enum DockerCmd {
+    /// List containers (name, image, ports, state).
+    Ps,
+    /// Print a container's logs.
+    Logs {
+        /// Container id or name.
+        id: String,
+        /// Number of lines to show.
+        #[arg(long, default_value_t = 100)]
+        tail: u64,
+    },
+    /// One-shot resource usage snapshot for a container.
+    Stats {
+        /// Container id or name.
+        id: String,
+    },
+    /// Run a command inside a container.
+    Exec {
+        /// Container id or name.
+        id: String,
+        /// Command and arguments to run.
+        #[arg(required = true, num_args = 1..)]
+        command: Vec<String>,
+    },
+    /// Start a container.
+    Start {
+        /// Container id or name.
+        id: String,
+    },
+    /// Stop a container.
+    Stop {
+        /// Container id or name.
+        id: String,
+    },
+    /// Restart a container.
+    Restart {
+        /// Container id or name.
+        id: String,
+    },
+    /// Reclaim unused Docker resources.
+    Prune {
+        /// What to prune: all, containers, images, volumes or networks.
+        #[arg(default_value = "all")]
+        target: String,
+    },
+}
+
+#[derive(Subcommand)]
+enum ServicesCmd {
+    /// List the Virtua stack services and their state (default).
+    List,
+    /// Restart a service, or the whole stack when no unit is given.
+    Restart {
+        /// systemd unit name (e.g. auxinuxvirtual-api).
+        unit: Option<String>,
+    },
+    /// Show detailed status of one service.
+    Status {
+        /// systemd unit name.
+        unit: String,
+    },
+}
+
 fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.command.unwrap_or(Command::Status) {
@@ -197,6 +273,21 @@ fn main() -> Result<()> {
                 VdmHaCmd::Disable => vdm::ha("disable"),
                 VdmHaCmd::Status => vdm::ha("status"),
             },
+        },
+        Command::Docker { cmd } => match cmd.unwrap_or(DockerCmd::Ps) {
+            DockerCmd::Ps => docker::ps(),
+            DockerCmd::Logs { id, tail } => docker::logs(&id, tail),
+            DockerCmd::Stats { id } => docker::stats(&id),
+            DockerCmd::Exec { id, command } => docker::exec(&id, &command),
+            DockerCmd::Start { id } => docker::action(&id, "start"),
+            DockerCmd::Stop { id } => docker::action(&id, "stop"),
+            DockerCmd::Restart { id } => docker::action(&id, "restart"),
+            DockerCmd::Prune { target } => docker::prune(&target),
+        },
+        Command::Services { cmd } => match cmd.unwrap_or(ServicesCmd::List) {
+            ServicesCmd::List => services::list(),
+            ServicesCmd::Restart { unit } => services::restart(unit.as_deref()),
+            ServicesCmd::Status { unit } => services::status(&unit),
         },
         Command::ApplyBranding => branding::apply(),
     }
