@@ -16,7 +16,7 @@
 # =============================================================================
 set -euo pipefail
 
-VIRTUAOS_VERSION="1.0.2-BETA"
+VIRTUAOS_VERSION="1.0.3-BETA"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 VIRTUA_SOURCE_DIR="${VIRTUA_SOURCE_DIR:-${SCRIPT_DIR}/../Virtua}"
 PROJECT_ROOT="$(cd "${VIRTUA_SOURCE_DIR}" 2>/dev/null && pwd || true)"

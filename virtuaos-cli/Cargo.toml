@@ -1,6 +1,6 @@
 [package]
 name = "virtuaos-cli"
-version = "0.1.10"
+version = "0.1.11"
 edition = "2021"
 description = "VirtuaOS — host & update manager"
 license = "proprietary"

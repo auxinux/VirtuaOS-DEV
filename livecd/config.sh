@@ -32,12 +32,12 @@ lb config \
     --iso-application "VirtuaOS" \
     --iso-preparer "VirtuaOS Build System" \
     --iso-publisher "AuxiNux — https://auxinux.io" \
-    --iso-volume "VirtuaOS-1.0.2-BETA" \
+    --iso-volume "VirtuaOS-1.0.3-BETA" \
     --memtest "none" \
     --win32-loader "false" \
     --linux-packages "kernel" \
     --linux-flavours "virtua" \
-    --image-name "VirtuaOS-1.0.2-BETA-amd64" \
+    --image-name "VirtuaOS-1.0.3-BETA-amd64" \
     --checksums "sha256" \
     --compression "xz" \
     --firmware-binary "true" \

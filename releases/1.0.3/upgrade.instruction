@@ -1,0 +1,45 @@
+{
+  "version": "1.0.3",
+  "messages": [
+    "Mise à jour VirtuaOS 1.0.3-BETA.",
+    "Cette version aligne la version affichée (console, interface web, vos version),",
+    "met à jour le noyau AuxiNux 7.1.10 et le panneau Virtua 0.7.48, et améliore",
+    "la détection matérielle de `vos status`."
+  ],
+  "aptUpdate": true,
+  "aptInstall": [
+    "kernel-virtua",
+    "auxinux-virtua",
+    "virtuaos-cli"
+  ],
+  "files": [
+    {
+      "path": "/etc/os-release"
+    },
+    {
+      "path": "/etc/issue"
+    },
+    {
+      "path": "/etc/issue.net"
+    },
+    {
+      "path": "/etc/profile.d/virtuaos.sh",
+      "mode": "0755"
+    },
+    {
+      "path": "/usr/local/bin/virtuaos-status",
+      "mode": "0755"
+    }
+  ],
+  "commands": [
+    {
+      "description": "Écrire le marqueur de version VirtuaOS",
+      "run": "printf '%s\\n' '1.0.3' > /etc/virtuaos-version"
+    },
+    {
+      "description": "Réappliquer le branding (os-release, issue, bannière)",
+      "run": "virtuaos apply-branding || true"
+    }
+  ],
+  "rebootRequired": true
+}

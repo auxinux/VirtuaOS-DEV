@@ -28,6 +28,19 @@ _MEM_FREE="$(awk '/MemAvailable/ {printf "%.0f", $2/1024}' /proc/meminfo 2>/dev/
 _DISK="$(df -h / 2>/dev/null | awk 'NR==2 {print $3"/"$2" ("$5")"}' || echo 'N/A')"
 _VIRTUA_PORT="8441"
 
+# ── VirtuaOS version (dynamic) ────────────────────────────────────────────────
+# Read the release marker written by `virtuaos apply-branding` (kept in sync by
+# the virtuaos-cli postinst on every upgrade). Fall back to /etc/os-release so
+# the banner never shows a stale hard-coded version.
+_VIRTUAOS_VERSION=""
+if [[ -f /etc/virtuaos-version ]]; then
+    _VIRTUAOS_VERSION="$(tr -d '[:space:]' < /etc/virtuaos-version)"
+fi
+if [[ -z "${_VIRTUAOS_VERSION}" && -f /etc/os-release ]]; then
+    _VIRTUAOS_VERSION="$(sed -n 's/^VERSION_ID="\?\([^"]*\)"\?/\1/p' /etc/os-release | head -1)"
+fi
+[[ -n "${_VIRTUAOS_VERSION}" ]] || _VIRTUAOS_VERSION="unknown"
+
 # Virtua service status
 _API_STATUS="$(systemctl is-active auxinuxvirtual-api 2>/dev/null || echo 'inactive')"
 _RUNNER_STATUS="$(systemctl is-active auxinuxvirtual-runner 2>/dev/null || echo 'inactive')"
@@ -51,7 +64,7 @@ _FIRSTBOOT_DONE="/etc/virtuaos/.firstboot-done"
 
 echo ""
 echo -e "${C_BOLD}${C_CYAN}  ╔════════════════════════════════════════════════╗${C_NC}"
-echo -e "${C_BOLD}${C_CYAN}  ║  VirtuaOS 1.0.2-BETA  •  Debian 13  •  x86_64 ║${C_NC}"
+echo -e "${C_BOLD}${C_CYAN}  ║  VirtuaOS ${_VIRTUAOS_VERSION}  •  Debian 13  •  x86_64 ║${C_NC}"
 echo -e "${C_BOLD}${C_CYAN}  ╚════════════════════════════════════════════════╝${C_NC}"
 echo ""
 echo -e "  ${C_DIM}System${C_NC}"

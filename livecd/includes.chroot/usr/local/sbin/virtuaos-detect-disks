@@ -62,6 +62,20 @@ while IFS= read -r line; do
     MODEL="$(lsblk -d -n -o MODEL "${DEV}" 2>/dev/null | sed 's/^ *//;s/ *$//' || echo "Unknown")"
     [[ -z "${MODEL}" ]] && MODEL="Unknown"
 
+    # Detect disk type (NVMe / SSD / HDD) for a clearer picker.
+    DISK_TYPE=""
+    if [[ "${NAME}" == nvme* ]]; then
+        DISK_TYPE="NVMe"
+    else
+        ROTA="$(lsblk -d -n -o ROTA "${DEV}" 2>/dev/null | tr -d ' ' || true)"
+        if [[ "${ROTA}" == "0" ]]; then
+            DISK_TYPE="SSD"
+        elif [[ "${ROTA}" == "1" ]]; then
+            DISK_TYPE="HDD"
+        fi
+    fi
+    [[ -n "${DISK_TYPE}" ]] && MODEL="${MODEL} (${DISK_TYPE})"
+
     printf "%s\t%s\t%s\tinternal\n" "${DEV}" "${SIZE_HR}" "${MODEL}"
 
 done < <(lsblk -d -b -n -o NAME,SIZE,TYPE,RM,TRAN 2>/dev/null)

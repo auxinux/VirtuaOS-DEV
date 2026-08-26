@@ -98,6 +98,103 @@ pub fn pkg_version(pkg: &str) -> Option<String> {
     capture("dpkg-query", &["-W", "-f=${Version}", pkg])
 }
 
+// ── Hardware detection (best-effort, never fatal) ────────────────────────────
+
+/// CPU model name from /proc/cpuinfo (first core), trimmed.
+fn cpu_model() -> Option<String> {
+    std::fs::read_to_string("/proc/cpuinfo")
+        .ok()
+        .and_then(|c| {
+            c.lines().find_map(|l| {
+                l.strip_prefix("model name")
+                    .or_else(|| l.strip_prefix("Model"))
+                    .map(|v| v.trim_start_matches(':').trim().to_string())
+            })
+        })
+        .filter(|s| !s.is_empty())
+}
+
+/// Number of logical CPUs (online processors).
+fn cpu_count() -> Option<usize> {
+    std::fs::read_to_string("/proc/cpuinfo")
+        .ok()
+        .map(|c| c.lines().filter(|l| l.starts_with("processor")).count())
+        .filter(|n| *n > 0)
+}
+
+/// Total RAM in MiB from /proc/meminfo.
+fn mem_total_mib() -> Option<u64> {
+    std::fs::read_to_string("/proc/meminfo").ok().and_then(|c| {
+        c.lines().find_map(|l| {
+            l.strip_prefix("MemTotal:")
+                .map(|v| v.trim().trim_end_matches("kB").trim().parse::<u64>().ok())
+        })
+        .flatten()
+        .map(|kb| kb / 1024)
+    })
+}
+
+/// Root filesystem size in GiB (via `df -B1 --output=size /`).
+fn root_disk_gib() -> Option<f64> {
+    let out = capture("df", &["-B1", "--output=size", "/"])?;
+    let bytes: u64 = out.lines().nth(1)?.trim().parse().ok()?;
+    Some(bytes as f64 / 1024.0 / 1024.0 / 1024.0)
+}
+
+/// KVM availability (hardware virtualization).
+fn kvm_available() -> bool {
+    std::path::Path::new("/dev/kvm").exists()
+}
+
+/// GPU vendor, detected from lspci (best-effort).
+fn gpu_vendor() -> Option<String> {
+    let out = capture("lspci", &[])?;
+    let line = out.lines().find(|l| {
+        let lower = l.to_lowercase();
+        lower.contains("vga compatible")
+            || lower.contains("3d controller")
+            || lower.contains("display controller")
+    })?;
+    let lower = line.to_lowercase();
+    if lower.contains("nvidia") {
+        Some("NVIDIA".into())
+    } else if lower.contains("amd") || lower.contains("ati") {
+        Some("AMD".into())
+    } else if lower.contains("intel") {
+        Some("Intel".into())
+    } else {
+        Some("unknown".into())
+    }
+}
+
+/// Print a compact hardware summary (CPU, RAM, disk, GPU, KVM).
+fn print_hardware() {
+    println!("{}", "── Hardware ──────────────────────────────".dimmed());
+    if let Some(model) = cpu_model() {
+        let cores = cpu_count().map(|n| format!(" · {n} cores")).unwrap_or_default();
+        println!("  {:<12} {}{}", "CPU", model, cores.dimmed());
+    }
+    if let Some(mib) = mem_total_mib() {
+        let gib = mib as f64 / 1024.0;
+        println!("  {:<12} {:.1} GiB", "Memory", gib);
+    }
+    if let Some(gib) = root_disk_gib() {
+        println!("  {:<12} {:.1} GiB", "Disk (/)", gib);
+    }
+    if let Some(vendor) = gpu_vendor() {
+        println!("  {:<12} {}", "GPU", vendor);
+    }
+    println!(
+        "  {:<12} {}",
+        "KVM",
+        if kvm_available() {
+            "available".green().to_string()
+        } else {
+            "unavailable".red().to_string()
+        }
+    );
+}
+
 pub fn service_active(unit: &str) -> bool {
     capture("systemctl", &["is-active", unit]).as_deref() == Some("active")
 }
@@ -130,6 +227,9 @@ pub fn print_versions() -> Result<()> {
 pub fn print_status() -> Result<()> {
     println!("{}", "── VirtuaOS ──────────────────────────────".dimmed());
     print_versions()?;
+
+    println!();
+    print_hardware();
 
     println!(
         "\n{}",

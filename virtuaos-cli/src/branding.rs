@@ -11,13 +11,20 @@
 //! KEEP IN SYNC (bump together every release) with:
 //!   • VirtuaOS/VERSION
 //!   • VirtuaOS/build.sh                          (VIRTUAOS_VERSION)
+//!   • VirtuaOS/livecd/config.sh                  (--iso-volume / --image-name)
 //!   • VirtuaOS/livecd/hooks/normal/0100-branding.hook.chroot (VIRTUAOS_VERSION + /etc/debian_version)
+//!   • VirtuaOS/livecd/bootloaders/grub-{pc,efi}/grub.cfg (menu labels + volume label)
+//!   • VirtuaOS/livecd/includes.chroot/usr/local/sbin/virtuaos-install (VERSION)
+//!
+//! The login banner (/etc/profile.d/virtuaos.sh) and `virtuaos-status` are
+//! DYNAMIC: they read /etc/virtuaos-version at runtime, so they follow upgrades
+//! automatically and must NOT be bumped by hand.
 
 use anyhow::{bail, Context, Result};
 use std::fs;
 
 /// Full VirtuaOS release string.
-pub const VIRTUAOS_RELEASE: &str = "1.0.2-BETA";
+pub const VIRTUAOS_RELEASE: &str = "1.0.3-BETA";
 
 const ISSUE_BANNER: &str = r#"
   ██╗   ██╗██╗██████╗ ████████╗██╗   ██╗ █████╗  ██████╗ ███████╗
@@ -28,7 +35,7 @@ const ISSUE_BANNER: &str = r#"
     ╚═══╝  ╚═╝╚═╝  ╚═╝   ╚═╝    ╚═════╝ ╚═╝  ╚═╝ ╚═════╝ ╚══════╝
 "#;
 
-/// Numeric part only, e.g. "1.0.2" from "1.0.2-BETA".
+/// Numeric part only, e.g. "1.0.2" from "1.0.3-BETA".
 pub fn short_version() -> &'static str {
     VIRTUAOS_RELEASE.split('-').next().unwrap_or(VIRTUAOS_RELEASE)
 }
